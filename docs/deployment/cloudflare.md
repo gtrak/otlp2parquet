@@ -33,14 +33,18 @@ Use `wrangler dev` to run the Worker locally, with support for hot-reloading and
     wrangler login
     ```
 
-2.  **Create a Preview R2 Bucket**:
+2.  **Configure `wrangler.toml`**:
+
+    Update `crates/otlp2parquet-cloudflare/wrangler.toml` to link point to a local instance of minio (start with docker-compose with the command `docker-compose up minio minio-init`). You can also point the worker to R2 using the R3 [S3-compatible API](https://developers.cloudflare.com/r2/api/s3/api/).
+
+3.  **Create a Preview R2 Bucket** (optional, only if pointing the local worker to R2):
 
     ```bash
     # This bucket is used by `wrangler dev` for local testing.
     wrangler r2 bucket create otlp-logs-preview
     ```
 
-3.  **Start the Local Server**:
+4.  **Start the Local Server**:
 
     ```bash
     # This command starts a local server that simulates the Cloudflare environment.
@@ -49,7 +53,7 @@ Use `wrangler dev` to run the Worker locally, with support for hot-reloading and
 
     Your Worker is now available at `http://localhost:8787`.
 
-4.  **Test Locally**:
+5.  **Test Locally**:
 
     Send a test request to your local Worker.
 
@@ -59,7 +63,7 @@ Use `wrangler dev` to run the Worker locally, with support for hot-reloading and
       --data-binary @testdata/logs.pb
     ```
 
-5.  **Verify Output**:
+6.  **Verify Output**:
 
     Check the contents of your preview R2 bucket.
 
@@ -69,28 +73,31 @@ Use `wrangler dev` to run the Worker locally, with support for hot-reloading and
 
 ## Deployment to Cloudflare
 
-After local testing, you can deploy the Worker to the Cloudflare global network.
+After local testing, you can deploy the Worker to the Cloudflare global network. By default, the Cloudflare worker has no authentication enabled: implement your own authentication or set `OTLP2PARQUET_BASIC_AUTH_ENABLED` in `wrangler.toml`.
 
 ### Option A: Quick Start (Deploy Button)
 
 The easiest way to deploy is with the deploy button, which forks the repository and handles the initial setup automatically.
 
-[![Deploy to Cloudflare Workers](https://deploy.workers.cloudflare.com/button)](https://deploy.workers.cloudflare.com/?url=https://github.com/smithclay/otlp2parquet)
+[![Deploy to Cloudflare Workers](https://deploy.workers.cloudflare.com/button)](https://github.com/smithclay/otlp2parquet/tree/main/crates/otlp2parquet-cloudflare)
 
 ### Option B: Manual Deployment
 
 1.  **Create a Production R2 Bucket**:
 
     ```bash
+    # use a different name, this must be globally unique
     wrangler r2 bucket create otlp-logs
     ```
 
 2.  **Configure `wrangler.toml`**:
 
-    Update `crates/otlp2parquet-cloudflare/wrangler.toml` to link to your R2 bucket.
+    Update `crates/otlp2parquet-cloudflare/wrangler.toml` to link to your R2 bucket and account.
 
     ```toml
     # crates/otlp2parquet-cloudflare/wrangler.toml
+    OTLP2PARQUET_S3_ENDPOINT = "https://YOUR_ACCOUNT_HERE.r2.cloudflarestorage.com"
+
     [[r2_buckets]]
     binding = "LOGS_BUCKET"
     bucket_name = "otlp-logs"
@@ -112,7 +119,7 @@ The easiest way to deploy is with the deploy button, which forks the repository 
 
     ```bash
     # Deploy to your production environment.
-    wrangler deploy
+    wrangler deploy --env production
     ```
 
     After deployment, Wrangler will output the public URL for your Worker.
@@ -128,9 +135,16 @@ Set non-sensitive configuration, such as batching parameters, in the `[vars]` se
 ```toml
 # crates/otlp2parquet-cloudflare/wrangler.toml
 [vars]
-OTLP2PARQUET_BATCH_MAX_ROWS = "100000"
-OTLP2PARQUET_BATCHING_ENABLED = "true"
+# Maximum request payload size in bytes (default: 10MB for Cloudflare Workers)
+# Adjust based on your data volume and Worker memory constraints (128MB total)
+OTLP2PARQUET_MAX_PAYLOAD_BYTES = "10485760"  # 10 MB
+
+# S3/R2 configuration
+OTLP2PARQUET_S3_BUCKET = "otlp-logs"
+OTLP2PARQUET_S3_REGION = "auto"
 ```
+
+> **Note**: The default max payload is 10MB for Cloudflare Workers. You can increase this up to ~50MB depending on your data complexity and memory usage, but monitor Worker memory carefully to avoid exceeding the 128MB limit.
 
 ### Secrets
 
@@ -159,3 +173,4 @@ wrangler tail
 
 *   **Build fails - WASM too large**: The WASM binary must be under 3MB (compressed). Use `make wasm-profile` from the workspace root to analyze binary size.
 *   **R2 Bucket Access Denied**: Ensure the `binding` name in `wrangler.toml` matches the one used in the code (`env.LOGS_BUCKET`). Also, verify your API token has the necessary R2 permissions.
+*   **413 Payload Too Large**: This error comes from your application's `OTLP2PARQUET_MAX_PAYLOAD_BYTES` setting (default 10MB), not from Cloudflare. Increase the limit via environment variable if needed, but monitor Worker memory usage (128MB total limit). The error message will show the current limit for debugging.
