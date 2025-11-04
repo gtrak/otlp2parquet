@@ -1,9 +1,27 @@
 name: Deploy Docs to GitHub Pages
 
 on:
-  release:
-    types:
-      - published
+  workflow_call:
+    inputs:
+      version:
+        description: 'Version tag (e.g., v0.0.2)'
+        required: true
+        type: string
+      ref:
+        description: 'Git ref to checkout'
+        required: false
+        type: string
+        default: ''
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version tag (e.g., v0.0.2)'
+        required: true
+        type: string
+      ref:
+        description: 'Git ref to checkout (defaults to version tag)'
+        required: false
+        type: string
 
 permissions:
   contents: write
@@ -12,14 +30,16 @@ permissions:
 
 env:
   CARGO_TERM_COLOR: always
-  DOC_VERSION: ${{ github.event.release.tag_name }}
+  DOC_VERSION: ${{ inputs.version }}
 
 jobs:
   deploy:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
+        with:
+          ref: ${{ inputs.ref || inputs.version }}
 
       - name: Setup Python
         uses: actions/setup-python@v6
@@ -39,23 +59,23 @@ jobs:
             exit 1
           fi
           python - <<'PY'
-            import os
-            import pathlib
-            import re
+          import os
+          import pathlib
+          import re
 
-            path = pathlib.Path("mkdocs.yml")
-            content = path.read_text()
-            version = os.environ.get("DOC_VERSION", "").strip()
-            if not version:
-                raise SystemExit("DOC_VERSION missing")
+          path = pathlib.Path("mkdocs.yml")
+          content = path.read_text()
+          version = os.environ.get("DOC_VERSION", "").strip()
+          if not version:
+              raise SystemExit("DOC_VERSION missing")
 
-            pattern = re.compile(r'(?m)^site_name: .+$')
-            replacement = f'site_name: otlp2parquet Documentation ({version})'
-            if pattern.search(content):
-                content = pattern.sub(replacement, content, count=1)
-            else:
-                content = replacement + "\n" + content
-            path.write_text(content)
+          pattern = re.compile(r'(?m)^site_name: .+$')
+          replacement = f'site_name: otlp2parquet Documentation ({version})'
+          if pattern.search(content):
+              content = pattern.sub(replacement, content, count=1)
+          else:
+              content = replacement + "\n" + content
+          path.write_text(content)
           PY
 
       - name: Build MkDocs site

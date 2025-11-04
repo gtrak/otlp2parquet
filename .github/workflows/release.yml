@@ -213,3 +213,18 @@ jobs:
             checksums.txt
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  docs:
+    name: Deploy Documentation
+    needs:
+      - prepare
+      - publish
+    if: needs.prepare.outputs.tag != ''
+    uses: ./.github/workflows/docs.yml
+    with:
+      version: ${{ needs.prepare.outputs.tag }}
+      ref: ${{ needs.prepare.outputs.commit }}
+    permissions:
+      contents: write
+      pages: write
+      id-token: write
