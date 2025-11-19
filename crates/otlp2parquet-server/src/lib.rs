@@ -22,30 +22,26 @@ use axum::{
 };
 use otlp2parquet_batch::{BatchConfig, BatchManager, PassthroughBatcher};
 use otlp2parquet_config::RuntimeConfig;
-use otlp2parquet_iceberg::IcebergCommitter;
-use otlp2parquet_storage::opendal_storage::OpenDalStorage;
-use otlp2parquet_storage::{set_parquet_row_group_size, ParquetWriter};
+use otlp2parquet_core::parquet::encoding::set_parquet_row_group_size;
 use serde_json::json;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::signal;
-use tracing::{error, info};
+use tracing::{error, info, warn};
 
 mod handlers;
 mod init;
 
 use handlers::{handle_logs, handle_metrics, handle_traces, health_check, ready_check};
-use init::{init_storage, init_tracing};
+use init::{init_tracing, init_writer};
 
 /// Application state shared across all requests
 #[derive(Clone)]
 pub(crate) struct AppState {
-    pub storage: Arc<OpenDalStorage>,
-    pub parquet_writer: Arc<ParquetWriter>,
+    pub writer: Arc<dyn otlp2parquet_writer::OtlpWriter>,
     pub batcher: Option<Arc<BatchManager>>,
     pub passthrough: PassthroughBatcher,
     pub max_payload_bytes: usize,
-    pub iceberg_committer: Option<Arc<IcebergCommitter>>,
 }
 
 /// Error type that implements IntoResponse
@@ -67,21 +63,29 @@ impl IntoResponse for AppError {
     }
 }
 
-impl<E> From<E> for AppError
-where
-    E: Into<anyhow::Error>,
-{
-    fn from(err: E) -> Self {
-        Self {
-            status: StatusCode::INTERNAL_SERVER_ERROR,
-            error: err.into(),
-        }
-    }
-}
-
 impl AppError {
     pub fn with_status(status: StatusCode, error: anyhow::Error) -> Self {
         Self { status, error }
+    }
+
+    pub fn bad_request<E>(error: E) -> Self
+    where
+        E: Into<anyhow::Error>,
+    {
+        Self {
+            status: StatusCode::BAD_REQUEST,
+            error: error.into(),
+        }
+    }
+
+    pub fn internal<E>(error: E) -> Self
+    where
+        E: Into<anyhow::Error>,
+    {
+        Self {
+            status: StatusCode::INTERNAL_SERVER_ERROR,
+            error: error.into(),
+        }
     }
 }
 
@@ -135,9 +139,8 @@ pub async fn run() -> Result<()> {
         .listen_addr
         .clone();
 
-    // Initialize storage
-    let storage = init_storage(&config)?;
-    let parquet_writer = Arc::new(ParquetWriter::new(storage.operator().clone()));
+    // Initialize writer (handles both storage and optional Iceberg catalog)
+    let writer = init_writer(&config).await?;
 
     // Configure batching
     let batch_config = BatchConfig {
@@ -162,50 +165,15 @@ pub async fn run() -> Result<()> {
     let max_payload_bytes = config.request.max_payload_bytes;
     info!("Max payload size set to {} bytes", max_payload_bytes);
 
-    // Initialize Iceberg committer if configured
-    let iceberg_committer = {
-        use otlp2parquet_iceberg::init::{initialize_committer, InitResult};
-        match initialize_committer().await {
-            InitResult::Success {
-                committer,
-                table_count,
-            } => {
-                info!(
-                    "Iceberg catalog integration enabled with {} tables",
-                    table_count
-                );
-                Some(committer)
-            }
-            InitResult::NotConfigured(msg) => {
-                info!("Iceberg catalog not configured: {}", msg);
-                None
-            }
-            InitResult::CatalogError(msg) => {
-                info!(
-                    "Failed to create Iceberg catalog: {} - continuing without Iceberg",
-                    msg
-                );
-                None
-            }
-            InitResult::NamespaceError(msg) => {
-                info!(
-                    "Failed to parse Iceberg namespace: {} - continuing without Iceberg",
-                    msg
-                );
-                None
-            }
-        }
-    };
-
     // Create app state
     let state = AppState {
-        storage,
-        parquet_writer,
+        writer: Arc::new(writer),
         batcher,
         passthrough: PassthroughBatcher::default(),
         max_payload_bytes,
-        iceberg_committer,
     };
+
+    let router_state = state.clone();
 
     // Build router
     let app = Router::new()
@@ -214,7 +182,7 @@ pub async fn run() -> Result<()> {
         .route("/v1/metrics", post(handle_metrics))
         .route("/health", get(health_check))
         .route("/ready", get(ready_check))
-        .with_state(state);
+        .with_state(router_state);
 
     // Create TCP listener
     let listener = tokio::net::TcpListener::bind(&addr)
@@ -236,7 +204,51 @@ pub async fn run() -> Result<()> {
         .await
         .context("Server error")?;
 
+    flush_pending_batches(&state).await?;
+
     info!("Server shutdown complete");
+
+    Ok(())
+}
+
+async fn flush_pending_batches(state: &AppState) -> Result<()> {
+    if let Some(batcher) = &state.batcher {
+        let pending = batcher
+            .drain_all()
+            .context("Failed to drain pending log batches during shutdown")?;
+
+        if pending.is_empty() {
+            return Ok(());
+        }
+
+        info!(
+            batch_count = pending.len(),
+            "Flushing buffered log batches before shutdown"
+        );
+
+        for completed in pending {
+            let rows = completed.metadata.record_count;
+            let service = completed.metadata.service_name.as_ref().to_string();
+            match handlers::persist_log_batch(state, &completed).await {
+                Ok(write_result) => {
+                    info!(
+                        path = %write_result.path,
+                        service_name = %service,
+                        rows,
+                        "Flushed pending batch"
+                    );
+                }
+                Err(e) => {
+                    warn!(
+                        error = %e,
+                        service_name = %service,
+                        rows,
+                        "Failed to flush pending batch during shutdown"
+                    );
+                }
+            }
+        }
+    }
 
     Ok(())
 }

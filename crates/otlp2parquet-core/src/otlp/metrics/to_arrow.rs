@@ -6,8 +6,7 @@
 use anyhow::{Context, Result};
 use arrow::array::{
     Array, BooleanBuilder, Float64Builder, GenericListArray, Int32Builder, Int64Builder,
-    ListBuilder, MapBuilder, OffsetSizeTrait, RecordBatch, StringBuilder,
-    TimestampNanosecondBuilder,
+    ListBuilder, OffsetSizeTrait, RecordBatch, StringBuilder, TimestampMicrosecondBuilder,
 };
 use arrow::datatypes::{DataType, Field};
 use otlp2parquet_proto::opentelemetry::proto::{
@@ -18,31 +17,61 @@ use otlp2parquet_proto::opentelemetry::proto::{
         ScopeMetrics,
     },
 };
-use std::collections::HashMap;
 use std::sync::Arc;
 
 use crate::otlp::common::{
-    any_value_builder::any_value_string, builder_helpers::map_field_names, field_names::semconv,
+    any_value_builder::{any_value_string, any_value_to_json_value},
+    field_names::semconv,
 };
 use crate::schema::metrics::*;
 
-/// Helper to convert a ListArray from a ListBuilder to have non-nullable items
+/// JSON-encode KeyValue attributes to string for S3 Tables compatibility
+fn keyvalue_attrs_to_json_string(attributes: &[KeyValue]) -> String {
+    if attributes.is_empty() {
+        return "{}".to_string();
+    }
+
+    let mut map = serde_json::Map::new();
+    for attr in attributes {
+        let json_value = attr
+            .value
+            .as_ref()
+            .map(any_value_to_json_value)
+            .unwrap_or(serde_json::Value::Null);
+        map.insert(attr.key.clone(), json_value);
+    }
+
+    serde_json::to_string(&map).unwrap_or_else(|_| "{}".to_string())
+}
+
+/// JSON-encode resource attributes (Vec of key-value pairs) to string
+fn resource_attrs_to_json_string(attributes: &[(String, String)]) -> String {
+    if attributes.is_empty() {
+        return "{}".to_string();
+    }
+
+    let mut map = serde_json::Map::new();
+    for (key, value) in attributes {
+        map.insert(key.clone(), serde_json::Value::String(value.clone()));
+    }
+
+    serde_json::to_string(&map).unwrap_or_else(|_| "{}".to_string())
+}
+
+/// Helper to convert a ListArray from a ListBuilder to use a specific field
 ///
-/// ListBuilder creates lists with nullable items by default, but our schema
-/// requires non-nullable items. This function reconstructs the array with
-/// the correct field definition.
-fn list_array_with_non_nullable_items<OffsetSize: OffsetSizeTrait>(
+/// ListBuilder creates lists with default fields, but our schema requires
+/// fields with specific metadata (field_id for Iceberg). This function
+/// reconstructs the array with the correct field definition from the schema.
+fn list_array_with_field<OffsetSize: OffsetSizeTrait>(
     list_array: GenericListArray<OffsetSize>,
-    item_type: DataType,
+    field: Field,
 ) -> GenericListArray<OffsetSize> {
     let values = list_array.values().clone();
     let offsets = list_array.offsets().clone();
     let nulls = list_array.nulls().cloned();
 
-    // Create field with non-nullable items
-    let field = Arc::new(Field::new("item", item_type, false));
-
-    GenericListArray::new(field, offsets, values, nulls)
+    GenericListArray::new(Arc::new(field), offsets, values, nulls)
 }
 
 /// Metadata extracted from metrics request
@@ -247,7 +276,7 @@ impl ArrowConverter {
 // Context structures for resource and scope information
 struct ResourceContext {
     service_name: String,
-    attributes: HashMap<String, String>,
+    attributes: Vec<(String, String)>,
 }
 
 struct ScopeContext {
@@ -257,7 +286,7 @@ struct ScopeContext {
 
 fn extract_resource_context(resource_metrics: &ResourceMetrics) -> ResourceContext {
     let mut service_name = String::new();
-    let mut attributes = HashMap::new();
+    let mut attributes = Vec::new();
 
     if let Some(resource) = &resource_metrics.resource {
         for attr in &resource.attributes {
@@ -269,7 +298,7 @@ fn extract_resource_context(resource_metrics: &ResourceMetrics) -> ResourceConte
             }
 
             // Store all attributes
-            attributes.insert(attr.key.clone(), value_str);
+            attributes.push((attr.key.clone(), value_str));
         }
     }
 
@@ -303,38 +332,30 @@ fn key_value_to_string(kv: &KeyValue) -> String {
 
 // Base columns builder for common fields across all metric types
 struct BaseColumnsBuilder {
-    timestamp_builder: TimestampNanosecondBuilder,
+    timestamp_builder: TimestampMicrosecondBuilder,
     service_name_builder: StringBuilder,
     metric_name_builder: StringBuilder,
     metric_description_builder: StringBuilder,
     metric_unit_builder: StringBuilder,
-    resource_attributes_builder: MapBuilder<StringBuilder, StringBuilder>,
+    resource_attributes_builder: StringBuilder,
     scope_name_builder: StringBuilder,
     scope_version_builder: StringBuilder,
-    attributes_builder: MapBuilder<StringBuilder, StringBuilder>,
+    attributes_builder: StringBuilder,
     count: usize,
 }
 
 impl BaseColumnsBuilder {
     fn new() -> Self {
         Self {
-            timestamp_builder: TimestampNanosecondBuilder::new().with_timezone("UTC"),
+            timestamp_builder: TimestampMicrosecondBuilder::new().with_timezone("UTC"),
             service_name_builder: StringBuilder::new(),
             metric_name_builder: StringBuilder::new(),
             metric_description_builder: StringBuilder::new(),
             metric_unit_builder: StringBuilder::new(),
-            resource_attributes_builder: MapBuilder::new(
-                Some(map_field_names()),
-                StringBuilder::new(),
-                StringBuilder::new(),
-            ),
+            resource_attributes_builder: StringBuilder::new(),
             scope_name_builder: StringBuilder::new(),
             scope_version_builder: StringBuilder::new(),
-            attributes_builder: MapBuilder::new(
-                Some(map_field_names()),
-                StringBuilder::new(),
-                StringBuilder::new(),
-            ),
+            attributes_builder: StringBuilder::new(),
             count: 0,
         }
     }
@@ -368,14 +389,10 @@ impl BaseColumnsBuilder {
             self.metric_unit_builder.append_value(&metric.unit);
         }
 
-        // Resource attributes
-        for (key, value) in &resource_ctx.attributes {
-            self.resource_attributes_builder.keys().append_value(key);
-            self.resource_attributes_builder
-                .values()
-                .append_value(value);
-        }
-        self.resource_attributes_builder.append(true)?;
+        // Resource attributes - JSON-encoded string for S3 Tables compatibility
+        let resource_attrs_json = resource_attrs_to_json_string(&resource_ctx.attributes);
+        self.resource_attributes_builder
+            .append_value(resource_attrs_json);
 
         // Scope information
         if scope_ctx.name.is_empty() {
@@ -389,14 +406,9 @@ impl BaseColumnsBuilder {
             self.scope_version_builder.append_null();
         }
 
-        // Data point attributes
-        for attr in attributes {
-            self.attributes_builder.keys().append_value(&attr.key);
-            self.attributes_builder
-                .values()
-                .append_value(key_value_to_string(attr));
-        }
-        self.attributes_builder.append(true)?;
+        // Data point attributes - JSON-encoded string for S3 Tables compatibility
+        let attributes_json = keyvalue_attrs_to_json_string(attributes);
+        self.attributes_builder.append_value(attributes_json);
 
         self.count += 1;
         Ok(())
@@ -428,7 +440,7 @@ impl GaugeBuilder {
         resource_ctx: &ResourceContext,
         scope_ctx: &ScopeContext,
     ) -> Result<()> {
-        let timestamp = clamp_nanos(point.time_unix_nano);
+        let timestamp = nanos_to_micros(point.time_unix_nano);
         self.base.add_common_fields(
             metric,
             timestamp,
@@ -498,7 +510,7 @@ impl SumBuilder {
         resource_ctx: &ResourceContext,
         scope_ctx: &ScopeContext,
     ) -> Result<()> {
-        let timestamp = clamp_nanos(point.time_unix_nano);
+        let timestamp = nanos_to_micros(point.time_unix_nano);
         self.base.add_common_fields(
             metric,
             timestamp,
@@ -558,12 +570,27 @@ struct HistogramBuilder {
 
 impl HistogramBuilder {
     fn new() -> Self {
+        let schema = otel_metrics_histogram_schema_arc();
+        // Get bucket_counts field (index 11) and explicit_bounds field (index 12)
+        let bucket_counts_field = if let DataType::List(field) = schema.field(11).data_type() {
+            field.as_ref().clone()
+        } else {
+            panic!("Expected List type for bucket_counts");
+        };
+        let explicit_bounds_field = if let DataType::List(field) = schema.field(12).data_type() {
+            field.as_ref().clone()
+        } else {
+            panic!("Expected List type for explicit_bounds");
+        };
+
         Self {
             base: BaseColumnsBuilder::new(),
             count_builder: Int64Builder::new(),
             sum_builder: Float64Builder::new(),
-            bucket_counts_builder: ListBuilder::new(Int64Builder::new()),
-            explicit_bounds_builder: ListBuilder::new(Float64Builder::new()),
+            bucket_counts_builder: ListBuilder::new(Int64Builder::new())
+                .with_field(bucket_counts_field),
+            explicit_bounds_builder: ListBuilder::new(Float64Builder::new())
+                .with_field(explicit_bounds_field),
             min_builder: Float64Builder::new(),
             max_builder: Float64Builder::new(),
         }
@@ -576,7 +603,7 @@ impl HistogramBuilder {
         resource_ctx: &ResourceContext,
         scope_ctx: &ScopeContext,
     ) -> Result<()> {
-        let timestamp = clamp_nanos(point.time_unix_nano);
+        let timestamp = nanos_to_micros(point.time_unix_nano);
         self.base.add_common_fields(
             metric,
             timestamp,
@@ -622,15 +649,23 @@ impl HistogramBuilder {
     }
 
     fn finish(mut self, schema: Arc<arrow::datatypes::Schema>) -> Result<RecordBatch> {
-        // Convert list arrays to have non-nullable items (schema requirement)
-        let bucket_counts = list_array_with_non_nullable_items(
-            self.bucket_counts_builder.finish(),
-            DataType::Int64,
-        );
-        let explicit_bounds = list_array_with_non_nullable_items(
-            self.explicit_bounds_builder.finish(),
-            DataType::Float64,
-        );
+        // Get list element fields from schema (with field_id metadata)
+        let bucket_counts_field = if let DataType::List(field) = schema.field(11).data_type() {
+            field.as_ref().clone()
+        } else {
+            panic!("Expected List type for bucket_counts");
+        };
+        let explicit_bounds_field = if let DataType::List(field) = schema.field(12).data_type() {
+            field.as_ref().clone()
+        } else {
+            panic!("Expected List type for explicit_bounds");
+        };
+
+        // Convert list arrays to use schema fields (with field_id metadata)
+        let bucket_counts =
+            list_array_with_field(self.bucket_counts_builder.finish(), bucket_counts_field);
+        let explicit_bounds =
+            list_array_with_field(self.explicit_bounds_builder.finish(), explicit_bounds_field);
 
         let batch = RecordBatch::try_new(
             schema,
@@ -676,6 +711,21 @@ struct ExponentialHistogramBuilder {
 
 impl ExponentialHistogramBuilder {
     fn new() -> Self {
+        let schema = otel_metrics_exponential_histogram_schema_arc();
+        // Get positive_bucket_counts field (index 14) and negative_bucket_counts field (index 16)
+        let positive_bucket_counts_field =
+            if let DataType::List(field) = schema.field(14).data_type() {
+                field.as_ref().clone()
+            } else {
+                panic!("Expected List type for positive_bucket_counts");
+            };
+        let negative_bucket_counts_field =
+            if let DataType::List(field) = schema.field(16).data_type() {
+                field.as_ref().clone()
+            } else {
+                panic!("Expected List type for negative_bucket_counts");
+            };
+
         Self {
             base: BaseColumnsBuilder::new(),
             count_builder: Int64Builder::new(),
@@ -683,9 +733,11 @@ impl ExponentialHistogramBuilder {
             scale_builder: Int32Builder::new(),
             zero_count_builder: Int64Builder::new(),
             positive_offset_builder: Int32Builder::new(),
-            positive_bucket_counts_builder: ListBuilder::new(Int64Builder::new()),
+            positive_bucket_counts_builder: ListBuilder::new(Int64Builder::new())
+                .with_field(positive_bucket_counts_field),
             negative_offset_builder: Int32Builder::new(),
-            negative_bucket_counts_builder: ListBuilder::new(Int64Builder::new()),
+            negative_bucket_counts_builder: ListBuilder::new(Int64Builder::new())
+                .with_field(negative_bucket_counts_field),
             min_builder: Float64Builder::new(),
             max_builder: Float64Builder::new(),
         }
@@ -698,7 +750,7 @@ impl ExponentialHistogramBuilder {
         resource_ctx: &ResourceContext,
         scope_ctx: &ScopeContext,
     ) -> Result<()> {
-        let timestamp = clamp_nanos(point.time_unix_nano);
+        let timestamp = nanos_to_micros(point.time_unix_nano);
         self.base.add_common_fields(
             metric,
             timestamp,
@@ -759,14 +811,28 @@ impl ExponentialHistogramBuilder {
     }
 
     fn finish(mut self, schema: Arc<arrow::datatypes::Schema>) -> Result<RecordBatch> {
-        // Convert list arrays to have non-nullable items (schema requirement)
-        let positive_bucket_counts = list_array_with_non_nullable_items(
+        // Get list element fields from schema (with field_id metadata)
+        let positive_bucket_counts_field =
+            if let DataType::List(field) = schema.field(14).data_type() {
+                field.as_ref().clone()
+            } else {
+                panic!("Expected List type for positive_bucket_counts");
+            };
+        let negative_bucket_counts_field =
+            if let DataType::List(field) = schema.field(16).data_type() {
+                field.as_ref().clone()
+            } else {
+                panic!("Expected List type for negative_bucket_counts");
+            };
+
+        // Convert list arrays to use schema fields (with field_id metadata)
+        let positive_bucket_counts = list_array_with_field(
             self.positive_bucket_counts_builder.finish(),
-            DataType::Int64,
+            positive_bucket_counts_field,
         );
-        let negative_bucket_counts = list_array_with_non_nullable_items(
+        let negative_bucket_counts = list_array_with_field(
             self.negative_bucket_counts_builder.finish(),
-            DataType::Int64,
+            negative_bucket_counts_field,
         );
 
         let batch = RecordBatch::try_new(
@@ -811,12 +877,27 @@ struct SummaryBuilder {
 
 impl SummaryBuilder {
     fn new() -> Self {
+        let schema = otel_metrics_summary_schema_arc();
+        // Get quantile_values field (index 11) and quantile_quantiles field (index 12)
+        let quantile_values_field = if let DataType::List(field) = schema.field(11).data_type() {
+            field.as_ref().clone()
+        } else {
+            panic!("Expected List type for quantile_values");
+        };
+        let quantile_quantiles_field = if let DataType::List(field) = schema.field(12).data_type() {
+            field.as_ref().clone()
+        } else {
+            panic!("Expected List type for quantile_quantiles");
+        };
+
         Self {
             base: BaseColumnsBuilder::new(),
             count_builder: Int64Builder::new(),
             sum_builder: Float64Builder::new(),
-            quantile_values_builder: ListBuilder::new(Float64Builder::new()),
-            quantile_quantiles_builder: ListBuilder::new(Float64Builder::new()),
+            quantile_values_builder: ListBuilder::new(Float64Builder::new())
+                .with_field(quantile_values_field),
+            quantile_quantiles_builder: ListBuilder::new(Float64Builder::new())
+                .with_field(quantile_quantiles_field),
         }
     }
 
@@ -827,7 +908,7 @@ impl SummaryBuilder {
         resource_ctx: &ResourceContext,
         scope_ctx: &ScopeContext,
     ) -> Result<()> {
-        let timestamp = clamp_nanos(point.time_unix_nano);
+        let timestamp = nanos_to_micros(point.time_unix_nano);
         self.base.add_common_fields(
             metric,
             timestamp,
@@ -859,14 +940,24 @@ impl SummaryBuilder {
     }
 
     fn finish(mut self, schema: Arc<arrow::datatypes::Schema>) -> Result<RecordBatch> {
-        // Convert list arrays to have non-nullable items (schema requirement)
-        let quantile_values = list_array_with_non_nullable_items(
-            self.quantile_values_builder.finish(),
-            DataType::Float64,
-        );
-        let quantile_quantiles = list_array_with_non_nullable_items(
+        // Get list element fields from schema (with field_id metadata)
+        let quantile_values_field = if let DataType::List(field) = schema.field(11).data_type() {
+            field.as_ref().clone()
+        } else {
+            panic!("Expected List type for quantile_values");
+        };
+        let quantile_quantiles_field = if let DataType::List(field) = schema.field(12).data_type() {
+            field.as_ref().clone()
+        } else {
+            panic!("Expected List type for quantile_quantiles");
+        };
+
+        // Convert list arrays to use schema fields (with field_id metadata)
+        let quantile_values =
+            list_array_with_field(self.quantile_values_builder.finish(), quantile_values_field);
+        let quantile_quantiles = list_array_with_field(
             self.quantile_quantiles_builder.finish(),
-            DataType::Float64,
+            quantile_quantiles_field,
         );
 
         let batch = RecordBatch::try_new(
@@ -896,9 +987,10 @@ impl SummaryBuilder {
 
 // Helper functions
 
+/// Convert OTLP nanosecond timestamps to microseconds for Iceberg compatibility
 #[inline]
-fn clamp_nanos(ns: u64) -> i64 {
-    (ns.min(i64::MAX as u64)) as i64
+fn nanos_to_micros(ns: u64) -> i64 {
+    ((ns / 1_000).min(i64::MAX as u64)) as i64
 }
 
 fn extract_number_value(point: &NumberDataPoint) -> Result<f64> {
@@ -944,10 +1036,11 @@ mod tests {
     }
 
     #[test]
-    fn test_clamp_nanos() {
-        assert_eq!(clamp_nanos(1000), 1000);
-        assert_eq!(clamp_nanos(i64::MAX as u64), i64::MAX);
-        assert_eq!(clamp_nanos(u64::MAX), i64::MAX);
+    fn test_nanos_to_micros() {
+        assert_eq!(nanos_to_micros(1_000_000), 1_000); // 1ms in nanos -> 1ms in micros
+        assert_eq!(nanos_to_micros(1_000), 1); // 1us in nanos -> 1us in micros
+        assert_eq!(nanos_to_micros(i64::MAX as u64), i64::MAX / 1_000);
+        assert_eq!(nanos_to_micros(u64::MAX), (u64::MAX / 1_000) as i64);
     }
 
     #[test]

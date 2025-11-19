@@ -7,18 +7,21 @@
 // - Essence: OTLP → Arrow transformation (THIS CRATE)
 // - Accident: Serialization format (Parquet), storage, networking (OTHER CRATES)
 //
-// Serialization (Arrow → Parquet) moved to: otlp2parquet-storage
+// Serialization (Arrow → Parquet) moved to: otlp2parquet-writer
 // Batching/optimization moved to: otlp2parquet-batch
 
 use anyhow::Result;
 use arrow::array::RecordBatch;
 
 pub mod otlp;
+pub mod parquet;
 pub mod schema;
+pub mod types;
 
 // Re-export commonly used types
 pub use otlp::{InputFormat, LogMetadata};
 pub use schema::otel_logs_schema;
+pub use types::{Blake3Hash, ParquetWriteResult, SignalType};
 
 /// Parse OTLP log data and convert to Arrow RecordBatch
 ///

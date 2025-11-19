@@ -3,8 +3,7 @@ members = [
     "crates/otlp2parquet-core",
     "crates/otlp2parquet-batch",
     "crates/otlp2parquet-config",
-    "crates/otlp2parquet-storage",
-    "crates/otlp2parquet-iceberg",
+    "crates/otlp2parquet-writer",
     "crates/otlp2parquet-proto",
     "crates/otlp2parquet-cloudflare",
     "crates/otlp2parquet-lambda",
@@ -35,9 +34,6 @@ opt-level = 3
 [profile.release.package.otlp2parquet-batch]
 opt-level = 3
 
-[profile.release.package.otlp2parquet-storage]
-opt-level = 3
-
 [profile.release.package.otlp2parquet-cloudflare]
 opt-level = "z"
 
@@ -50,7 +46,7 @@ opt-level = 3
 [workspace.dependencies]
 # Arrow/Parquet - MINIMAL features only
 arrow = { version = "56.2", default-features = false, features = ["ipc"] }
-parquet = { version = "56.2", default-features = false }
+parquet = { version = "56.2", default-features = false, features = ["snap"] }
 
 # OTLP Protocol - minimal
 prost = { version = "0.13", default-features = false, features = ["std"] }
@@ -67,6 +63,13 @@ blake3 = "1"
 once_cell = "1.19"
 hex = "0.4"
 base64 = "0.22"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt", "ansi"] }
+
+# AWS SigV4 for S3 Tables authentication
+aws-sigv4 = { version = "1.3.6", default-features = false, features = ["sign-http"] }
+aws-credential-types = { version = "1.2", default-features = false }
+aws-config = { version = "1.8", default-features = false, features = ["rustls", "behavior-version-latest", "rt-tokio"] }
 
 # Build dependencies
 prost-build = "0.13"
@@ -82,7 +85,6 @@ repository.workspace = true
 [dependencies]
 otlp2parquet-core = { path = "crates/otlp2parquet-core" }
 otlp2parquet-batch = { path = "crates/otlp2parquet-batch" }
-otlp2parquet-storage = { path = "crates/otlp2parquet-storage" }
 otlp2parquet-server = { path = "crates/otlp2parquet-server" }
 
 # Runtime
@@ -126,18 +128,11 @@ path = "src/lib.rs"
 prost-build = { workspace = true }
 
 # Benchmark targets
-[[bench]]
-name = "e2e_pipeline"
-harness = false
-
+# TODO: Rewrite e2e_pipeline and parquet_write benchmarks for new otlp2parquet-writer architecture
 [[bench]]
 name = "decode_otlp"
 harness = false
 
 [[bench]]
 name = "transform_arrow"
-harness = false
-
-[[bench]]
-name = "parquet_write"
 harness = false

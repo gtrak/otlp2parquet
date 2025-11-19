@@ -26,7 +26,7 @@ cleanup() {
   if [ "${KEEP_CONTAINERS:-0}" = "1" ]; then
     echo "ℹ️  Containers preserved for debugging (KEEP_CONTAINERS=1)"
     echo "    View logs:     docker compose logs"
-    echo "    Inspect MinIO: docker compose exec minio mc ls minio/otlp-logs"
+    echo "    Inspect MinIO: docker compose exec minio mc ls minio/otlp"
     echo "    Cleanup:       docker compose down -v"
   else
     echo "Cleaning up containers..."
@@ -39,7 +39,7 @@ trap cleanup EXIT
 
 # Start services
 echo "Starting Docker services..."
-docker compose up -d minio nessie otlp2parquet
+docker compose up -d minio rest otlp2parquet
 
 # Wait for services to be ready
 echo "Waiting for otlp2parquet to be ready..."
@@ -48,17 +48,6 @@ timeout 60 bash -c 'until curl -sf http://localhost:4318/health > /dev/null 2>&1
   docker compose logs otlp2parquet
   exit 1
 }
-
-# Wait for Nessie if running Iceberg tests
-if [ "${TEST_ICEBERG:-0}" = "1" ]; then
-  echo "Waiting for Nessie catalog to be ready..."
-  # Nessie health check is on management port 9002 (mapped from container port 9000)
-  timeout 60 bash -c 'until curl -sf http://localhost:9002/q/health/ready > /dev/null 2>&1; do sleep 3; done' || {
-    echo "ERROR: Nessie catalog failed to become ready within 60 seconds"
-    docker compose logs nessie
-    exit 1
-  }
-fi
 
 echo "Services ready!"
 
@@ -73,3 +62,15 @@ else
 fi
 
 echo "✓ Tests passed!"
+
+# Run DuckDB verification if Iceberg tests enabled
+if [ "${TEST_ICEBERG:-0}" = "1" ]; then
+  echo ""
+  echo "Running DuckDB verification..."
+  if command -v duckdb &> /dev/null; then
+    ./scripts/verify-duckdb.sh
+  else
+    echo "⚠️  DuckDB not installed - skipping verification"
+    echo "    Install: brew install duckdb (macOS) or https://duckdb.org/docs/installation/"
+  fi
+fi

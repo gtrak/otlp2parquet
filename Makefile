@@ -76,8 +76,14 @@ build-server: ## Build server binary only (default mode)
 	@cargo build --release
 
 .PHONY: build-lambda
-build-lambda: ## Build Lambda binary only
-	@cargo build --release -p otlp2parquet-lambda
+build-lambda: ## Build Lambda binary and create bootstrap-arm64.zip for deployment
+	@echo "==> Building Lambda binary with cargo-lambda..."
+	@cd crates/otlp2parquet-lambda && cargo lambda build --release --arm64
+	@echo "==> Creating bootstrap-arm64.zip..."
+	@cd target/lambda/bootstrap && zip -q ../bootstrap-arm64.zip bootstrap
+	@echo "==> Lambda deployment package ready at: target/lambda/bootstrap-arm64.zip"
+	@SIZE=$$(stat -f%z target/lambda/bootstrap-arm64.zip 2>/dev/null || stat -c%s target/lambda/bootstrap-arm64.zip 2>/dev/null); \
+	python3 -c "import sys; size=int(sys.argv[1]); print(f\"==> Package size: {size/1024:.1f} KB ({size/1024/1024:.2f} MB)\")" $$SIZE
 
 .PHONY: build-cloudflare
 build-cloudflare: ## Build Cloudflare Workers with worker-build
@@ -157,6 +163,7 @@ wasm-full: wasm-compress wasm-profile ## Build, optimize, compress, and profile 
 .PHONY: clean
 clean: ## Remove build artifacts
 	@cargo clean
+	@rm -rf target/lambda
 
 .PHONY: clean-wasm
 clean-wasm: ## Remove WASM-specific artifacts
@@ -323,16 +330,16 @@ profile-all: bloat llvm-lines flamegraph ## Run all profiling tools
 #
 
 .PHONY: test-e2e
-test-e2e: ## Run core e2e tests with Docker (MinIO, otlp2parquet)
-	@./scripts/test-e2e.sh
+test-e2e: ## Run core e2e tests with Docker (MinIO, otlp2parquet). Override TEST_ICEBERG=1 or KEEP_CONTAINERS=1 for advanced scenarios.
+	@TEST_ICEBERG=$(TEST_ICEBERG) KEEP_CONTAINERS=$(KEEP_CONTAINERS) ./scripts/test-e2e.sh
 
 .PHONY: test-e2e-iceberg
-test-e2e-iceberg: ## Run e2e tests including Iceberg catalog validation
-	@TEST_ICEBERG=1 ./scripts/test-e2e.sh
+test-e2e-iceberg: TEST_ICEBERG=1
+test-e2e-iceberg: test-e2e ## Run e2e tests including Iceberg catalog validation and DuckDB verification
 
 .PHONY: test-e2e-debug
-test-e2e-debug: ## Run e2e tests and preserve containers for debugging
-	@KEEP_CONTAINERS=1 ./scripts/test-e2e.sh
+test-e2e-debug: KEEP_CONTAINERS=1
+test-e2e-debug: test-e2e ## Run e2e tests and preserve containers for debugging
 
 .PHONY: test-all
 test-all: test test-e2e ## Run unit tests + core e2e tests

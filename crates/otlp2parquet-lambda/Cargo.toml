@@ -9,9 +9,10 @@ license.workspace = true
 otlp2parquet-core = { path = "../otlp2parquet-core" }
 otlp2parquet-batch = { path = "../otlp2parquet-batch" }
 otlp2parquet-config = { path = "../otlp2parquet-config" }
-otlp2parquet-storage = { path = "../otlp2parquet-storage", features = ["services-s3"] }
-otlp2parquet-iceberg = { path = "../otlp2parquet-iceberg" }
+otlp2parquet-writer = { path = "../otlp2parquet-writer" }
 arrow = { workspace = true }
+icepick = { git = "https://github.com/smithclay/icepick.git", rev = "388286c31ebd8d9d8707dfb18fe0991541457ebd", default-features = false }
+opendal = { version = "0.54", default-features = false, features = ["services-s3"] }
 
 # AWS Lambda runtime (provides tokio runtime)
 lambda_runtime = "0.14"
@@ -23,6 +24,11 @@ base64 = "0.22"
 serde = { workspace = true }
 serde_json = { workspace = true }
 anyhow = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+
+[build-dependencies]
+chrono = { version = "0.4", features = ["clock"] }
 
 [[bin]]
 name = "bootstrap"

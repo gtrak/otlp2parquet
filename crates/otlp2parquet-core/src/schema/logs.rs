@@ -7,7 +7,7 @@
 // diverging from the OTLP standard which uses snake_case. The conversion happens
 // during the OTLP → Arrow transformation. See CLAUDE.md for rationale.
 
-use arrow::datatypes::{DataType, Field, Fields, Schema, TimeUnit};
+use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
 use std::collections::HashMap;
 use std::sync::{Arc, OnceLock};
 
@@ -31,115 +31,54 @@ pub fn otel_logs_schema_arc() -> Arc<Schema> {
 }
 
 fn build_schema() -> Schema {
+    // S3 Tables doesn't support complex types (Map, Struct) - use JSON-encoded strings instead
+    // This matches the Iceberg schema definition in iceberg_schemas::logs_schema()
+    let string_type = DataType::Utf8;
+
     let fields = vec![
         // ============ Common Fields (IDs 1-20) ============
         // Shared across all signal types for cross-signal queries and schema evolution
+        // Iceberg v1/v2 only supports microsecond precision timestamps
         field_with_id(
             field::TIMESTAMP,
-            DataType::Timestamp(TimeUnit::Nanosecond, Some("UTC".into())),
+            DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())),
             false,
             1,
         ),
-        field_with_id(field::TRACE_ID, DataType::FixedSizeBinary(16), false, 2),
-        field_with_id(field::SPAN_ID, DataType::FixedSizeBinary(8), false, 3),
+        // S3 Tables doesn't support FixedSizeBinary - use Binary instead
+        field_with_id(field::TRACE_ID, DataType::Binary, false, 2),
+        field_with_id(field::SPAN_ID, DataType::Binary, false, 3),
         field_with_id(field::SERVICE_NAME, DataType::Utf8, false, 4),
         field_with_id(field::SERVICE_NAMESPACE, DataType::Utf8, true, 5),
         field_with_id(field::SERVICE_INSTANCE_ID, DataType::Utf8, true, 6),
-        field_with_id(
-            field::RESOURCE_ATTRIBUTES,
-            DataType::Map(
-                Arc::new(Field::new(
-                    field::ENTRIES,
-                    DataType::Struct(
-                        vec![
-                            Field::new(field::KEY, DataType::Utf8, false),
-                            Field::new(
-                                field::VALUE,
-                                DataType::Struct(any_value_fields_for_builder()),
-                                true,
-                            ),
-                        ]
-                        .into(),
-                    ),
-                    false,
-                )),
-                false,
-            ),
-            false,
-            7,
-        ),
+        // ResourceAttributes: JSON-encoded string for S3 Tables compatibility
+        field_with_id(field::RESOURCE_ATTRIBUTES, string_type.clone(), false, 7),
         field_with_id(field::RESOURCE_SCHEMA_URL, DataType::Utf8, true, 8),
         field_with_id(field::SCOPE_NAME, DataType::Utf8, false, 9),
         field_with_id(field::SCOPE_VERSION, DataType::Utf8, true, 10),
-        field_with_id(
-            field::SCOPE_ATTRIBUTES,
-            DataType::Map(
-                Arc::new(Field::new(
-                    field::ENTRIES,
-                    DataType::Struct(
-                        vec![
-                            Field::new(field::KEY, DataType::Utf8, false),
-                            Field::new(
-                                field::VALUE,
-                                DataType::Struct(any_value_fields_for_builder()),
-                                true,
-                            ),
-                        ]
-                        .into(),
-                    ),
-                    false,
-                )),
-                false,
-            ),
-            false,
-            11,
-        ),
+        // ScopeAttributes: JSON-encoded string for S3 Tables compatibility
+        field_with_id(field::SCOPE_ATTRIBUTES, string_type.clone(), false, 11),
         field_with_id(field::SCOPE_SCHEMA_URL, DataType::Utf8, true, 12),
-        // ============ Logs-Specific Fields (IDs 21+) ============
+        // ============ Logs-Specific Fields (IDs 13-19) ============
         field_with_id(
             field::TIMESTAMP_TIME,
             DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())),
             false,
-            21,
+            13,
         ),
         field_with_id(
             field::OBSERVED_TIMESTAMP,
-            DataType::Timestamp(TimeUnit::Nanosecond, Some("UTC".into())),
+            DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())),
             false,
-            22,
+            14,
         ),
-        field_with_id(field::TRACE_FLAGS, DataType::UInt32, false, 23),
-        field_with_id(field::SEVERITY_TEXT, DataType::Utf8, false, 24),
-        field_with_id(field::SEVERITY_NUMBER, DataType::Int32, false, 25),
-        field_with_id(
-            field::BODY,
-            DataType::Struct(any_value_fields_for_builder()),
-            true,
-            26,
-        ),
-        field_with_id(
-            field::LOG_ATTRIBUTES,
-            DataType::Map(
-                Arc::new(Field::new(
-                    field::ENTRIES,
-                    DataType::Struct(
-                        vec![
-                            Field::new(field::KEY, DataType::Utf8, false),
-                            Field::new(
-                                field::VALUE,
-                                DataType::Struct(any_value_fields_for_builder()),
-                                true,
-                            ),
-                        ]
-                        .into(),
-                    ),
-                    false,
-                )),
-                false,
-            ),
-            false,
-            27,
-        ),
+        field_with_id(field::TRACE_FLAGS, DataType::UInt32, false, 15),
+        field_with_id(field::SEVERITY_TEXT, DataType::Utf8, false, 16),
+        field_with_id(field::SEVERITY_NUMBER, DataType::Int32, false, 17),
+        // Body: JSON-encoded string for S3 Tables compatibility
+        field_with_id(field::BODY, string_type.clone(), true, 18),
+        // LogAttributes: JSON-encoded string for S3 Tables compatibility
+        field_with_id(field::LOG_ATTRIBUTES, string_type, false, 19),
     ];
 
     let mut metadata = HashMap::new();
@@ -163,20 +102,6 @@ pub const EXTRACTED_RESOURCE_ATTRS: &[&str] = &[
     semconv::SERVICE_NAMESPACE,
     semconv::SERVICE_INSTANCE_ID,
 ];
-
-/// AnyValue fields for runtime array builders (no field_id metadata)
-pub(crate) fn any_value_fields_for_builder() -> Fields {
-    vec![
-        Field::new(field::TYPE, DataType::Utf8, false),
-        Field::new(field::STRING_VALUE, DataType::Utf8, true),
-        Field::new(field::BOOL_VALUE, DataType::Boolean, true),
-        Field::new(field::INT_VALUE, DataType::Int64, true),
-        Field::new(field::DOUBLE_VALUE, DataType::Float64, true),
-        Field::new(field::BYTES_VALUE, DataType::Binary, true),
-        Field::new(field::JSON_VALUE, DataType::LargeUtf8, true),
-    ]
-    .into()
-}
 
 #[cfg(test)]
 mod tests {

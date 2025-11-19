@@ -2,6 +2,7 @@
 //
 // Implements OTLP ingestion and health check endpoints
 
+use anyhow::Context;
 use arrow::array::{Array, RecordBatch, StringArray, TimestampNanosecondArray};
 use axum::{
     extract::State,
@@ -11,11 +12,12 @@ use axum::{
 };
 use metrics::{counter, histogram};
 use otlp2parquet_batch::CompletedBatch;
-use otlp2parquet_core::{otlp, InputFormat};
+use otlp2parquet_core::{otlp, InputFormat, ParquetWriteResult};
 use prost::Message;
 use serde_json::json;
+use std::sync::Arc;
 use std::time::Instant;
-use tracing::{debug, info, warn};
+use tracing::{debug, info};
 
 use crate::{AppError, AppState};
 
@@ -68,24 +70,11 @@ pub(crate) async fn health_check() -> impl IntoResponse {
     (StatusCode::OK, Json(json!({"status": "healthy"})))
 }
 
-/// GET /ready - Readiness check (includes storage connectivity)
-pub(crate) async fn ready_check(State(state): State<AppState>) -> impl IntoResponse {
-    // Test storage connectivity by listing (basic check)
-    match state.storage.list("").await {
-        Ok(_) => (
-            StatusCode::OK,
-            Json(json!({"status": "ready", "storage": "connected"})),
-        ),
-        Err(e) => {
-            warn!("Storage readiness check failed: {}", e);
-            (
-                StatusCode::SERVICE_UNAVAILABLE,
-                Json(
-                    json!({"status": "not ready", "storage": "disconnected", "error": e.to_string()}),
-                ),
-            )
-        }
-    }
+/// GET /ready - Readiness check
+pub(crate) async fn ready_check(State(_state): State<AppState>) -> impl IntoResponse {
+    // Writer is always ready after initialization
+    // TODO: Add actual health checks if needed (e.g., test write to storage)
+    (StatusCode::OK, Json(json!({"status": "ready"})))
 }
 
 async fn handle_signal(
@@ -131,7 +120,7 @@ async fn process_logs(
     histogram!("otlp.ingest.bytes", body.len() as f64);
 
     let request = otlp::parse_otlp_request(&body, format)
-        .map_err(|e| e.context("Failed to parse OTLP request payload"))?;
+        .map_err(|e| AppError::bad_request(e.context("Failed to parse OTLP request payload")))?;
 
     let per_service_requests = otlp::logs::split_request_by_service(request);
     let mut uploads: Vec<CompletedBatch<otlp::LogMetadata>> = Vec::new();
@@ -140,14 +129,14 @@ async fn process_logs(
     if let Some(batcher) = &state.batcher {
         let mut expired = batcher
             .drain_expired()
-            .map_err(|e| e.context("Failed to flush expired batches"))?;
+            .map_err(|e| AppError::internal(e.context("Failed to flush expired batches")))?;
         uploads.append(&mut expired);
 
         for subset in &per_service_requests {
             let approx_bytes = subset.encoded_len();
             let (mut ready, meta) = batcher
                 .ingest(subset, approx_bytes)
-                .map_err(|e| e.context("Failed to enqueue batch"))?;
+                .map_err(|e| AppError::internal(e.context("Failed to enqueue batch")))?;
             total_records += meta.record_count;
             uploads.append(&mut ready);
         }
@@ -156,7 +145,7 @@ async fn process_logs(
             let batch = state
                 .passthrough
                 .ingest(&subset)
-                .map_err(|e| e.context("Failed to convert OTLP to Arrow"))?;
+                .map_err(|e| AppError::bad_request(e.context("Failed to convert OTLP to Arrow")))?;
             total_records += batch.metadata.record_count;
             uploads.push(batch);
         }
@@ -166,27 +155,10 @@ async fn process_logs(
 
     let mut uploaded_paths = Vec::new();
     for completed in uploads {
-        let write_result = state
-            .parquet_writer
-            .write_batches_with_hash(
-                &completed.batches,
-                &completed.metadata.service_name,
-                completed.metadata.first_timestamp_nanos,
-            )
+        let write_result = persist_log_batch(state, &completed)
             .await
-            .map_err(|e| e.context("Failed to write Parquet to storage"))?;
+            .map_err(AppError::internal)?;
         let partition_path = write_result.path.clone();
-
-        // Commit to Iceberg catalog if configured (warn-and-succeed on error)
-        if let Some(committer) = &state.iceberg_committer {
-            if let Err(e) = committer
-                .commit_with_signal("logs", None, &[write_result])
-                .await
-            {
-                warn!("Failed to commit logs to Iceberg catalog: {}", e);
-                // Continue - files are in storage even if catalog commit failed
-            }
-        }
 
         counter!("otlp.batch.flushes", 1);
         histogram!("otlp.batch.rows", completed.metadata.record_count as f64);
@@ -222,16 +194,19 @@ async fn process_traces(
     histogram!("otlp.ingest.bytes", body.len() as f64, "signal" => "traces");
 
     // Parse OTLP traces request
-    let request = otlp::traces::parse_otlp_trace_request(&body, format)
-        .map_err(|e| e.context("Failed to parse OTLP traces request payload"))?;
+    let request = otlp::traces::parse_otlp_trace_request(&body, format).map_err(|e| {
+        AppError::bad_request(e.context("Failed to parse OTLP traces request payload"))
+    })?;
 
     let per_service_requests = otlp::traces::split_request_by_service(request);
     let mut uploaded_paths = Vec::new();
     let mut spans_processed: usize = 0;
 
     for subset in per_service_requests {
-        let (batches, metadata) = otlp::traces::TraceArrowConverter::convert(&subset)
-            .map_err(|e| e.context("Failed to convert OTLP traces to Arrow"))?;
+        let (batches, metadata) =
+            otlp::traces::TraceArrowConverter::convert(&subset).map_err(|e| {
+                AppError::bad_request(e.context("Failed to convert OTLP traces to Arrow"))
+            })?;
 
         if batches.is_empty() || metadata.span_count == 0 {
             continue;
@@ -245,26 +220,23 @@ async fn process_traces(
         );
 
         let service_name = metadata.service_name.as_ref();
-        let write_result = state
-            .parquet_writer
-            .write_batches_with_signal(
-                &batches,
-                service_name,
-                metadata.first_timestamp_nanos,
-                "traces",
-                None, // No subdirectory for traces (unlike metrics)
-            )
-            .await
-            .map_err(|e| e.context("Failed to write traces Parquet to storage"))?;
-        let partition_path = write_result.path.clone();
 
-        if let Some(committer) = &state.iceberg_committer {
-            if let Err(e) = committer
-                .commit_with_signal("traces", None, &[write_result])
+        // Write traces using new writer trait
+        let mut partition_path = String::new();
+        for batch in &batches {
+            let result = state
+                .writer
+                .write_batch(
+                    batch,
+                    otlp2parquet_core::SignalType::Traces,
+                    None, // No metric type for traces
+                    service_name,
+                    metadata.first_timestamp_nanos,
+                )
                 .await
-            {
-                warn!("Failed to commit traces to Iceberg catalog: {}", e);
-            }
+                .map_err(|e| AppError::internal(e.context("Failed to write traces to storage")))?;
+
+            partition_path = result.path; // Track last path for logging
         }
 
         counter!("otlp.traces.flushes", 1);
@@ -316,8 +288,9 @@ async fn process_metrics(
     histogram!("otlp.ingest.bytes", body.len() as f64, "signal" => "metrics");
 
     // Parse OTLP metrics request
-    let request = otlp::metrics::parse_otlp_request(&body, format)
-        .map_err(|e| e.context("Failed to parse OTLP metrics request payload"))?;
+    let request = otlp::metrics::parse_otlp_request(&body, format).map_err(|e| {
+        AppError::bad_request(e.context("Failed to parse OTLP metrics request payload"))
+    })?;
 
     let per_service_requests = otlp::metrics::split_request_by_service(request);
     let converter = otlp::metrics::ArrowConverter::new();
@@ -325,9 +298,9 @@ async fn process_metrics(
     let mut uploaded_paths = Vec::new();
 
     for subset in per_service_requests {
-        let (batches_by_type, subset_metadata) = converter
-            .convert(subset)
-            .map_err(|e| e.context("Failed to convert OTLP metrics to Arrow"))?;
+        let (batches_by_type, subset_metadata) = converter.convert(subset).map_err(|e| {
+            AppError::bad_request(e.context("Failed to convert OTLP metrics to Arrow"))
+        })?;
 
         aggregated.resource_metrics_count += subset_metadata.resource_metrics_count;
         aggregated.scope_metrics_count += subset_metadata.scope_metrics_count;
@@ -341,32 +314,23 @@ async fn process_metrics(
             let service_name = extract_service_name(&batch);
             let timestamp_nanos = extract_first_timestamp(&batch);
 
-            let write_result = state
-                .parquet_writer
-                .write_batches_with_signal(
-                    &[batch],
+            let result = state
+                .writer
+                .write_batch(
+                    &batch,
+                    otlp2parquet_core::SignalType::Metrics,
+                    Some(&metric_type),
                     &service_name,
                     timestamp_nanos,
-                    "metrics",
-                    Some(&metric_type),
                 )
                 .await
                 .map_err(|e| {
-                    e.context(format!("Failed to write {} metrics Parquet", metric_type))
+                    AppError::internal(
+                        e.context(format!("Failed to write {} metrics", metric_type)),
+                    )
                 })?;
-            let partition_path = write_result.path.clone();
 
-            if let Some(committer) = &state.iceberg_committer {
-                if let Err(e) = committer
-                    .commit_with_signal("metrics", Some(&metric_type), &[write_result])
-                    .await
-                {
-                    warn!(
-                        "Failed to commit {} metrics to Iceberg catalog: {}",
-                        metric_type, e
-                    );
-                }
-            }
+            let partition_path = result.path.clone();
 
             counter!("otlp.metrics.flushes", 1, "metric_type" => metric_type.clone());
             info!(
@@ -418,6 +382,71 @@ async fn process_metrics(
     }));
 
     Ok((StatusCode::OK, response).into_response())
+}
+
+pub(crate) async fn persist_log_batch(
+    state: &AppState,
+    completed: &CompletedBatch<otlp::LogMetadata>,
+) -> anyhow::Result<ParquetWriteResult> {
+    let mut uploaded_paths = Vec::new();
+
+    for batch in &completed.batches {
+        let result = state
+            .writer
+            .write_batch(
+                batch,
+                otlp2parquet_core::SignalType::Logs,
+                None, // No metric type for logs
+                &completed.metadata.service_name,
+                completed.metadata.first_timestamp_nanos,
+            )
+            .await
+            .context("Failed to write logs to storage")?;
+
+        uploaded_paths.push(result.path.clone());
+    }
+
+    // Return first write result for backward compatibility
+    // (caller expects single ParquetWriteResult)
+    // NOTE: Most fields are not populated since the new writer doesn't track them
+    let schema = completed
+        .batches
+        .first()
+        .map(|b| b.schema())
+        .unwrap_or_else(|| Arc::new(arrow::datatypes::Schema::empty()));
+
+    // Create minimal parquet metadata (required fields only)
+    use parquet::schema::types::Type;
+    let parquet_schema = Type::group_type_builder("schema")
+        .build()
+        .expect("Failed to build parquet schema");
+    let schema_descriptor = Arc::new(parquet::schema::types::SchemaDescriptor::new(Arc::new(
+        parquet_schema,
+    )));
+
+    let file_metadata = parquet::file::metadata::FileMetaData::new(
+        0,    // version
+        0,    // num rows
+        None, // created_by
+        None, // key_value_metadata
+        schema_descriptor,
+        None, // column_orders
+    );
+
+    let parquet_metadata = Arc::new(parquet::file::metadata::ParquetMetaData::new(
+        file_metadata,
+        vec![], // row groups
+    ));
+
+    Ok(ParquetWriteResult {
+        path: uploaded_paths.into_iter().next().unwrap_or_default(),
+        hash: otlp2parquet_core::Blake3Hash::new([0u8; 32]),
+        file_size: 0,
+        row_count: completed.metadata.record_count as i64,
+        arrow_schema: schema,
+        parquet_metadata,
+        completed_at: chrono::Utc::now(),
+    })
 }
 
 fn extract_service_name(batch: &RecordBatch) -> String {

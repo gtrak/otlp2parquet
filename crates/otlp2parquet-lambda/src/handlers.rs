@@ -74,13 +74,7 @@ async fn handle_post(
     match signal {
         SignalKind::Logs => process_logs(body.as_ref(), format, content_type, state).await,
         SignalKind::Metrics => process_metrics(body.as_ref(), format, content_type, state).await,
-        SignalKind::Traces => HttpResponseData::json(
-            501,
-            json!({
-                "error": "OTLP trace ingestion not implemented yet",
-            })
-            .to_string(),
-        ),
+        SignalKind::Traces => process_traces(body.as_ref(), format, content_type, state).await,
     }
 }
 
@@ -93,9 +87,11 @@ async fn process_logs(
     let request = match otlp::parse_otlp_request(body, format) {
         Ok(req) => req,
         Err(err) => {
-            eprintln!(
+            tracing::error!(
                 "Failed to parse OTLP logs (format: {:?}, content-type: {:?}): {}",
-                format, content_type, err
+                format,
+                content_type,
+                err
             );
             return HttpResponseData::json(
                 400,
@@ -115,7 +111,7 @@ async fn process_logs(
                 uploads.push(batch);
             }
             Err(err) => {
-                eprintln!("Failed to convert OTLP to Arrow: {}", err);
+                tracing::error!("Failed to convert OTLP to Arrow: {}", err);
                 return HttpResponseData::json(
                     500,
                     json!({ "error": "internal encoding failure" }).to_string(),
@@ -126,36 +122,29 @@ async fn process_logs(
 
     let mut uploaded_paths = Vec::new();
     for batch in uploads {
-        // Write RecordBatch to Parquet and upload (hash computed in storage layer)
-        match state
-            .parquet_writer
-            .write_batches_with_hash(
-                &batch.batches,
-                &batch.metadata.service_name,
-                batch.metadata.first_timestamp_nanos,
-            )
-            .await
-        {
-            Ok(write_result) => {
-                uploaded_paths.push(write_result.path.clone());
-
-                // Commit to Iceberg catalog if configured (warn-and-succeed on error)
-                if let Some(committer) = &state.iceberg_committer {
-                    if let Err(e) = committer
-                        .commit_with_signal("logs", None, &[write_result])
-                        .await
-                    {
-                        eprintln!("Warning: Failed to commit logs to Iceberg catalog: {}", e);
-                        // Continue - files are in S3 even if catalog commit failed
-                    }
+        // Write logs via new OtlpWriter trait
+        for record_batch in &batch.batches {
+            match state
+                .writer
+                .write_batch(
+                    record_batch,
+                    otlp2parquet_core::SignalType::Logs,
+                    None, // No metric type for logs
+                    &batch.metadata.service_name,
+                    batch.metadata.first_timestamp_nanos,
+                )
+                .await
+            {
+                Ok(result) => {
+                    uploaded_paths.push(result.path);
                 }
-            }
-            Err(err) => {
-                eprintln!("Failed to write Parquet to storage: {}", err);
-                return HttpResponseData::json(
-                    500,
-                    json!({ "error": "internal storage failure" }).to_string(),
-                );
+                Err(err) => {
+                    tracing::error!("Failed to write logs: {}", err);
+                    return HttpResponseData::json(
+                        500,
+                        json!({ "error": "internal storage failure" }).to_string(),
+                    );
+                }
             }
         }
     }
@@ -182,9 +171,11 @@ async fn process_metrics(
     let request = match otlp::metrics::parse_otlp_request(body, format) {
         Ok(req) => req,
         Err(err) => {
-            eprintln!(
+            tracing::error!(
                 "Failed to parse OTLP metrics (format: {:?}, content-type: {:?}): {}",
-                format, content_type, err
+                format,
+                content_type,
+                err
             );
             return HttpResponseData::json(
                 400,
@@ -202,7 +193,7 @@ async fn process_metrics(
         let (batches_by_type, subset_metadata) = match converter.convert(subset) {
             Ok(result) => result,
             Err(err) => {
-                eprintln!("Failed to convert OTLP metrics to Arrow: {}", err);
+                tracing::error!("Failed to convert OTLP metrics to Arrow: {}", err);
                 return HttpResponseData::json(
                     500,
                     json!({ "error": "internal encoding failure" }).to_string(),
@@ -223,33 +214,21 @@ async fn process_metrics(
             let timestamp_nanos = extract_first_timestamp(&batch);
 
             match state
-                .parquet_writer
-                .write_batches_with_signal(
-                    &[batch],
+                .writer
+                .write_batch(
+                    &batch,
+                    otlp2parquet_core::SignalType::Metrics,
+                    Some(&metric_type),
                     &service_name,
                     timestamp_nanos,
-                    "metrics",
-                    Some(&metric_type),
                 )
                 .await
             {
-                Ok(write_result) => {
-                    uploaded_paths.push(write_result.path.clone());
-
-                    if let Some(committer) = &state.iceberg_committer {
-                        if let Err(e) = committer
-                            .commit_with_signal("metrics", Some(&metric_type), &[write_result])
-                            .await
-                        {
-                            eprintln!(
-                                "Warning: Failed to commit {} metrics to Iceberg catalog: {}",
-                                metric_type, e
-                            );
-                        }
-                    }
+                Ok(result) => {
+                    uploaded_paths.push(result.path);
                 }
                 Err(err) => {
-                    eprintln!("Failed to write {} metrics Parquet: {}", metric_type, err);
+                    tracing::error!("Failed to write {} metrics: {}", metric_type, err);
                     return HttpResponseData::json(
                         500,
                         json!({ "error": "internal storage failure" }).to_string(),
@@ -286,6 +265,92 @@ async fn process_metrics(
             "histogram_count": aggregated.histogram_count,
             "exponential_histogram_count": aggregated.exponential_histogram_count,
             "summary_count": aggregated.summary_count,
+            "partitions": uploaded_paths,
+        })
+        .to_string(),
+    )
+}
+
+async fn process_traces(
+    body: &[u8],
+    format: otlp2parquet_core::InputFormat,
+    content_type: Option<&str>,
+    state: &LambdaState,
+) -> HttpResponseData {
+    let request = match otlp::traces::parse_otlp_trace_request(body, format) {
+        Ok(req) => req,
+        Err(err) => {
+            tracing::error!(
+                "Failed to parse OTLP traces (format: {:?}, content-type: {:?}): {}",
+                format,
+                content_type,
+                err
+            );
+            return HttpResponseData::json(
+                400,
+                json!({ "error": "invalid OTLP traces payload" }).to_string(),
+            );
+        }
+    };
+
+    let per_service_requests = otlp::traces::split_request_by_service(request);
+    let mut uploads = Vec::new();
+    let mut total_spans = 0usize;
+
+    for subset in per_service_requests {
+        match otlp::traces::TraceArrowConverter::convert(&subset) {
+            Ok((batches, metadata)) => {
+                total_spans += metadata.span_count;
+                uploads.push((batches, metadata));
+            }
+            Err(err) => {
+                tracing::error!("Failed to convert OTLP traces to Arrow: {}", err);
+                return HttpResponseData::json(
+                    500,
+                    json!({ "error": "internal encoding failure" }).to_string(),
+                );
+            }
+        }
+    }
+
+    let mut uploaded_paths = Vec::new();
+    for (batches, _metadata) in uploads {
+        // Write traces via Writer (handles both Iceberg and PlainS3 modes)
+        for record_batch in &batches {
+            let service_name = extract_service_name(record_batch);
+            let timestamp_nanos = extract_first_timestamp(record_batch);
+
+            match state
+                .writer
+                .write_batch(
+                    record_batch,
+                    otlp2parquet_core::SignalType::Traces,
+                    None, // No metric type for traces
+                    &service_name,
+                    timestamp_nanos,
+                )
+                .await
+            {
+                Ok(result) => {
+                    uploaded_paths.push(result.path);
+                }
+                Err(err) => {
+                    tracing::error!("Failed to write traces: {}", err);
+                    return HttpResponseData::json(
+                        500,
+                        json!({ "error": "internal storage failure" }).to_string(),
+                    );
+                }
+            }
+        }
+    }
+
+    HttpResponseData::json(
+        200,
+        json!({
+            "status": "ok",
+            "spans_processed": total_spans,
+            "flush_count": uploaded_paths.len(),
             "partitions": uploaded_paths,
         })
         .to_string(),
