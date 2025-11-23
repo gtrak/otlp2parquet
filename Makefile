@@ -357,7 +357,7 @@ smoke-server: ## Run server smoke tests only (requires Docker + DuckDB)
 		exit 1; \
 	fi
 	@echo "==> Running server smoke tests (both catalog modes)..."
-	@cargo test --test smoke --features smoke-server
+	@cargo test --test smoke --features smoke-server -- --test-threads=1
 
 .PHONY: smoke-server-verbose
 smoke-server-verbose: ## Run server smoke tests with verbose output

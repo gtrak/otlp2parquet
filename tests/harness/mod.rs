@@ -426,6 +426,7 @@ impl DuckDBVerifier {
             .context("Failed to write DuckDB script")?;
 
         tracing::info!("DuckDB script written to: {:?}", script_path);
+        tracing::info!("Catalog endpoint for DuckDB: {}", self.catalog_endpoint);
 
         // Execute DuckDB with script as input
         let mut child = Command::new("duckdb")
@@ -447,10 +448,12 @@ impl DuckDBVerifier {
             drop(stdin); // Close stdin to signal EOF
         }
 
-        let output = child
-            .wait_with_output()
-            .await
-            .context("Failed to execute duckdb")?;
+        // Add timeout to prevent hanging on connection issues
+        let output =
+            tokio::time::timeout(std::time::Duration::from_secs(30), child.wait_with_output())
+                .await
+                .context("DuckDB execution timed out after 30s")?
+                .context("Failed to execute duckdb")?;
 
         // Keep temp file for debugging if test fails
         if !output.status.success() {
