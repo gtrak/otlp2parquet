@@ -239,6 +239,16 @@ install-tools: ## Install required development tools
 	fi
 	@echo "==> Installing uv (Python package manager)..."
 	@curl -LsSf https://astral.sh/uv/install.sh | sh
+	@echo "==> Installing DuckDB (for smoke tests)..."
+	@if command -v duckdb >/dev/null 2>&1; then \
+		echo "duckdb already installed."; \
+	elif command -v brew >/dev/null 2>&1; then \
+		brew install duckdb; \
+	else \
+		echo "Please install DuckDB manually:"; \
+		echo "  Linux: wget https://github.com/duckdb/duckdb/releases/latest/download/duckdb_cli-linux-amd64.zip && unzip duckdb_cli-linux-amd64.zip && sudo mv duckdb /usr/local/bin/"; \
+		echo "  macOS: brew install duckdb"; \
+	fi
 	@echo "==> Setting up pre-commit hooks..."
 	@uvx pre-commit install
 	@echo "==> All tools installed!"
@@ -261,6 +271,9 @@ version: ## Show versions of build tools
 	@wrangler --version 2>/dev/null || echo "wrangler: not installed"
 	@sam --version 2>/dev/null | head -n 1 || echo "aws-sam-cli: not installed"
 	@cargo-lambda --version 2>/dev/null || echo "cargo-lambda: not installed"
+	@echo ""
+	@echo "Data tools:"
+	@duckdb --version 2>/dev/null || echo "duckdb: not installed"
 
 .PHONY: audit
 audit: ## Run security audit on dependencies
@@ -335,7 +348,14 @@ test-smoke: ## Run smoke tests for all platforms (requires Docker + cloud creden
 	@cargo test --test smoke --features smoke-server,smoke-lambda,smoke-workers
 
 .PHONY: smoke-server
-smoke-server: ## Run server smoke tests only (requires Docker)
+smoke-server: ## Run server smoke tests only (requires Docker + DuckDB)
+	@echo "==> Checking for DuckDB..."
+	@if ! command -v duckdb >/dev/null 2>&1; then \
+		echo "ERROR: DuckDB not found. Install it:"; \
+		echo "  macOS: brew install duckdb"; \
+		echo "  Linux: wget https://github.com/duckdb/duckdb/releases/latest/download/duckdb_cli-linux-amd64.zip && unzip duckdb_cli-linux-amd64.zip && sudo mv duckdb /usr/local/bin/"; \
+		exit 1; \
+	fi
 	@echo "==> Running server smoke tests (both catalog modes)..."
 	@cargo test --test smoke --features smoke-server
 
