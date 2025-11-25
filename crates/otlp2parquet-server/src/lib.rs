@@ -33,7 +33,8 @@ mod handlers;
 mod init;
 
 use handlers::{handle_logs, handle_metrics, handle_traces, health_check, ready_check};
-use init::{init_tracing, init_writer};
+pub use init::init_tracing;
+use init::init_writer;
 
 /// Application state shared across all requests
 #[derive(Clone)]
@@ -123,11 +124,14 @@ async fn shutdown_signal() {
     }
 }
 
-/// Entry point for server mode
+/// Entry point for server mode (loads config automatically)
 pub async fn run() -> Result<()> {
-    // Load configuration
     let config = RuntimeConfig::load().context("Failed to load configuration")?;
+    run_with_config(config).await
+}
 
+/// Entry point for server mode with pre-loaded configuration (for CLI usage)
+pub async fn run_with_config(config: RuntimeConfig) -> Result<()> {
     // Initialize tracing with config
     init_tracing(&config);
 
