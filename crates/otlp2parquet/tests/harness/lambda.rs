@@ -27,6 +27,8 @@ use anyhow::{Context, Result};
 use aws_config::BehaviorVersion;
 use aws_sdk_cloudformation::Client as CfnClient;
 use aws_sdk_cloudwatchlogs::Client as LogsClient;
+use aws_sdk_s3::primitives::ByteStream;
+use aws_sdk_s3::Client as S3Client;
 use aws_sdk_s3tables::Client as S3TablesClient;
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -41,8 +43,10 @@ pub struct LambdaHarness {
     region: String,
     /// S3 Tables namespace
     namespace: String,
-    /// SAM template path
-    template_path: PathBuf,
+    /// S3 bucket for Lambda ZIP upload
+    lambda_bucket: String,
+    /// S3 key for Lambda ZIP
+    lambda_key: String,
     /// AWS SDK config
     aws_config: aws_config::SdkConfig,
     /// Catalog mode (S3 Tables or plain Parquet)
@@ -73,20 +77,40 @@ impl LambdaHarness {
             .load()
             .await;
 
-        // Choose template based on catalog mode
-        let template_filename = match catalog_mode {
-            CatalogMode::Enabled => "lambda-template.yaml",
-            CatalogMode::None => "lambda-template-plain-parquet.yaml",
-        };
-        let template_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("../../scripts/smoke")
-            .join(template_filename);
+        // Upload Lambda ZIP to S3
+        let lambda_bucket = std::env::var("SMOKE_TEST_LAMBDA_BUCKET")
+            .context("SMOKE_TEST_LAMBDA_BUCKET env var required")?;
+        let lambda_key = format!("smoke-tests/{}/bootstrap-arm64.zip", stack_name);
+
+        let s3_client = S3Client::new(&aws_config);
+        let zip_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../target/lambda/bootstrap-arm64.zip");
+
+        tracing::info!(
+            "Uploading Lambda ZIP to s3://{}/{}",
+            lambda_bucket,
+            lambda_key
+        );
+
+        let body = ByteStream::from_path(&zip_path)
+            .await
+            .context("Failed to read Lambda ZIP file")?;
+
+        s3_client
+            .put_object()
+            .bucket(&lambda_bucket)
+            .key(&lambda_key)
+            .body(body)
+            .send()
+            .await
+            .context("Failed to upload Lambda ZIP to S3")?;
 
         Ok(Self {
             stack_name,
             region,
             namespace,
-            template_path,
+            lambda_bucket,
+            lambda_key,
             aws_config,
             catalog_mode,
         })
@@ -98,17 +122,44 @@ impl SmokeTestHarness for LambdaHarness {
     async fn deploy(&self) -> Result<DeploymentInfo> {
         tracing::info!("Deploying Lambda smoke test stack: {}", self.stack_name);
 
-        // 1. Deploy using SAM CLI (automatically packages and uploads Lambda ZIP)
-        let sam_deploy = Command::new("uvx")
+        // Read and render the template
+        let template_path =
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("templates/cloudformation.yaml");
+        let template_content = std::fs::read_to_string(&template_path)
+            .context("Failed to read CloudFormation template")?;
+
+        // Generate unique bucket name for data storage
+        let data_bucket_name = format!("otlp2parquet-smoke-{}", &self.stack_name);
+
+        // Render template placeholders
+        let catalog_mode = match self.catalog_mode {
+            CatalogMode::Enabled => "iceberg",
+            CatalogMode::None => "none",
+        };
+
+        let rendered = template_content
+            .replace("{{STACK_NAME}}", &self.stack_name)
+            .replace("{{BUCKET_NAME}}", &data_bucket_name)
+            .replace("{{CATALOG_MODE}}", catalog_mode)
+            .replace("{{LOG_RETENTION}}", "7")
+            .replace("{{LAMBDA_S3_BUCKET}}", &self.lambda_bucket)
+            .replace("{{LAMBDA_S3_KEY}}", &self.lambda_key);
+
+        // Write rendered template to temp file
+        let temp_template = std::env::temp_dir().join(format!("{}-template.yaml", self.stack_name));
+        std::fs::write(&temp_template, &rendered).context("Failed to write rendered template")?;
+
+        // Deploy using CloudFormation CLI
+        let temp_template_str = temp_template
+            .to_str()
+            .context("Temp template path contains invalid UTF-8")?;
+
+        let deploy = Command::new("aws")
             .args([
-                "--python",
-                "3.13",
-                "--from",
-                "aws-sam-cli",
-                "sam",
+                "cloudformation",
                 "deploy",
                 "--template-file",
-                self.template_path.to_str().unwrap(),
+                temp_template_str,
                 "--stack-name",
                 &self.stack_name,
                 "--region",
@@ -116,24 +167,30 @@ impl SmokeTestHarness for LambdaHarness {
                 "--capabilities",
                 "CAPABILITY_IAM",
                 "--parameter-overrides",
+                "AuthType=NONE",
                 &format!("IcebergNamespace={}", self.namespace),
-                "--resolve-s3",
-                "--no-confirm-changeset",
                 "--no-fail-on-empty-changeset",
-                "--force-upload", // Force SAM to upload template even if hash matches
             ])
             .output()
             .await
-            .context("Failed to execute SAM deploy")?;
+            .context("Failed to execute CloudFormation deploy")?;
 
-        if !sam_deploy.status.success() {
-            let stderr = String::from_utf8_lossy(&sam_deploy.stderr);
-            anyhow::bail!("SAM deploy failed: {}", stderr);
+        if !deploy.status.success() {
+            let stderr = String::from_utf8_lossy(&deploy.stderr);
+            let stdout = String::from_utf8_lossy(&deploy.stdout);
+            anyhow::bail!(
+                "CloudFormation deploy failed:\nstderr: {}\nstdout: {}",
+                stderr,
+                stdout
+            );
         }
 
-        tracing::info!("SAM deployment complete");
+        tracing::info!("CloudFormation deployment complete");
 
-        // 2. Get stack outputs using CloudFormation SDK
+        // Clean up temp template
+        let _ = std::fs::remove_file(&temp_template);
+
+        // Get stack outputs using CloudFormation SDK
         let cfn_client = CfnClient::new(&self.aws_config);
 
         // Wait a bit for stack to stabilize
@@ -475,6 +532,23 @@ impl SmokeTestHarness for LambdaHarness {
             .context("Failed to delete CloudFormation stack")?;
 
         tracing::info!("CloudFormation stack deletion initiated");
+
+        // Clean up the uploaded Lambda ZIP
+        let s3_client = S3Client::new(&self.aws_config);
+        tracing::info!(
+            "Deleting Lambda ZIP from s3://{}/{}",
+            self.lambda_bucket,
+            self.lambda_key
+        );
+        if let Err(e) = s3_client
+            .delete_object()
+            .bucket(&self.lambda_bucket)
+            .key(&self.lambda_key)
+            .send()
+            .await
+        {
+            tracing::warn!("Failed to delete Lambda ZIP: {}", e);
+        }
 
         Ok(())
     }
