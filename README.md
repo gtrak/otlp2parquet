@@ -10,6 +10,8 @@ Receive OpenTelemetry logs, metrics, and traces over HTTP and write them as Parq
 
 ## Quick Start
 
+See [Deploy to Cloud](#deploy-to-the-cloud) for running in an AWS Lambda or Cloudflare Worker.
+
 ```bash
 # requires Rust toolchain: `curl https://sh.rustup.rs -sSf | sh`
 cargo install otlp2parquet
@@ -28,10 +30,11 @@ curl -X POST http://localhost:4318/v1/logs \
 Query it:
 
 ```bash
-duckdb -c "SELECT * FROM 'data/logs/**/*.parquet'"
+# see https://duckdb.org/install
+duckdb -c "SELECT * FROM './data/logs/**/*.parquet'"
 ```
 
-## Why does this exist?
+## Why?
 
 - **Keep logs forever** — Parquet on S3 costs ~$0.02/GB/month vs $2+/GB in most vendors
 - **Query with real tools** — DuckDB, Spark, Athena, Trino, pandas
@@ -42,19 +45,19 @@ duckdb -c "SELECT * FROM 'data/logs/**/*.parquet'"
 
 Once you've kicked the tires locally, deploy to serverless:
 
-**Cloudflare Workers + R2:**
+**Cloudflare Workers + R2 or R2 Data Catalog:**
 ```bash
-# Generates Cloudformation template
+# Generates a wrangler.toml for wrangler CLI
+# To install wrangler: `npm i -D wrangler@latest`
 otlp2parquet deploy cloudflare
 
 # Deploy to Cloudflare with wrangler
 wrangler deploy
-
 ```
 
-**AWS Lambda + S3:**
+**AWS Lambda + S3 or S3 Tables:**
 ```bash
-# Generates a wranger.toml file
+# Generates a Cloudformation template.yaml
 otlp2parquet deploy aws
 
 # Deploy with Cloudformation
