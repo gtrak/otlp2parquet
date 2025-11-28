@@ -23,7 +23,7 @@ jobs:
           - target: x86_64-unknown-linux-gnu
             arch: amd64
             runner: ubuntu-latest
-            lambda_arch: x86_64
+            lambda_arch: x86-64
             asset_name: otlp2parquet-lambda-linux-amd64
             cli_asset_name: otlp2parquet-cli-linux-amd64
           - target: aarch64-unknown-linux-gnu
