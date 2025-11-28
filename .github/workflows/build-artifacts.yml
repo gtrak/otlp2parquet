@@ -23,11 +23,13 @@ jobs:
           - target: x86_64-unknown-linux-gnu
             arch: amd64
             runner: ubuntu-latest
+            lambda_arch: x86_64
             asset_name: otlp2parquet-lambda-linux-amd64
             cli_asset_name: otlp2parquet-cli-linux-amd64
           - target: aarch64-unknown-linux-gnu
             arch: arm64
             runner: ubuntu-24.04-arm
+            lambda_arch: arm64
             asset_name: otlp2parquet-lambda-linux-arm64
             cli_asset_name: otlp2parquet-cli-linux-arm64
     steps:
@@ -43,11 +45,25 @@ jobs:
           cache-prefix: release-native
           cache-key: ${{ matrix.target }}
 
-      - name: Build lambda binary
-        env:
-          TARGET: ${{ matrix.target }}
-        run: cargo build --release --target "$TARGET" -p otlp2parquet-lambda
+      - name: Install Zig toolchain
+        uses: mlugg/setup-zig@v1
+        with:
+          version: 0.13.0
 
+      - name: Install cargo-lambda
+        run: pip install cargo-lambda
+
+      # Use cargo-lambda for Lambda binary - it cross-compiles with proper glibc targeting
+      # for Amazon Linux 2023 (glibc 2.34), regardless of host glibc version
+      - name: Build lambda binary with cargo-lambda
+        run: |
+          cd crates/otlp2parquet-lambda
+          cargo lambda build --release --${{ matrix.lambda_arch }}
+          # Copy to expected location for packaging
+          mkdir -p ../../target/${{ matrix.target }}/release
+          cp ../../target/lambda/bootstrap/bootstrap ../../target/${{ matrix.target }}/release/bootstrap
+
+      # CLI binary uses native compilation - glibc version doesn't matter for server/container use
       - name: Build CLI binary
         env:
           TARGET: ${{ matrix.target }}
