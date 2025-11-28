@@ -182,7 +182,7 @@ jobs:
           rm -rf worker-dist
           mkdir -p worker-dist
           cd crates/otlp2parquet-cloudflare
-          wrangler deploy --dry-run --outdir ../../worker-dist
+          wrangler deploy --dry-run --outdir ../../worker-dist --config wrangler.ci.toml
 
       - name: Optimize packaged WASM
         run: |

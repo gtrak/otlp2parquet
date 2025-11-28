@@ -1,0 +1,7 @@
+# Minimal wrangler config for CI builds (no secrets, just packaging)
+name = "otlp2parquet-ci-build"
+main = "build/index.js"
+compatibility_date = "2025-01-15"
+
+[build]
+command = "cargo install -q worker-build && worker-build --release"
