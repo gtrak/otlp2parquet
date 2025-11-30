@@ -80,14 +80,16 @@ Both commands walk you through setup and generate the config files you need.
 Logs, Metrics, Traces via OTLP/HTTP (protobuf or JSON, gzip compression supported). No gRPC support for now.
 
 
-## Stable Surface (v1)
+## APIs, schemas, and partition layout
 - OTLP/HTTP endpoints: `/v1/logs`, `/v1/metrics`, `/v1/traces` (protobuf or JSON; gzip supported)
 - Partition layout: `logs/{service}/year=.../hour=.../{ts}-{uuid}.parquet`, `metrics/{type}/{service}/...`, `traces/{service}/...`
 - Storage: filesystem, S3, or R2 with optional Iceberg catalog
 - Schemas: ClickHouse-compatible, PascalCase columns; five metric schemas (Gauge, Sum, Histogram, ExponentialHistogram, Summary)
 - Error model: HTTP 400 on invalid input/too large; 5xx on conversion/storage
 
-**Best-effort catalog commits**: Parquet files are always written to storage first. If you enable an Iceberg catalog (S3 Tables, R2 Data Catalog), catalog registration happens after the write. If catalog registration fails (network error, conflict), the data is still safely stored and a warning is logged—your data is never lost due to catalog issues.
+**Best-effort catalog commits**: Parquet files are always written to storage first. If you enable an Iceberg catalog (S3 Tables, R2 Data Catalog), catalog registration happens after the write.
+
+If catalog registration fails (network error, conflict), the data is still safely stored and a warning is logged—your data is never lost due to catalog issues. **This is not a production-ready solution for catalog commits**. PRs welcome.
 
 ## Future work (contributions welcome)
 - OpenTelemetry Arrow alignment
@@ -97,10 +99,10 @@ Logs, Metrics, Traces via OTLP/HTTP (protobuf or JSON, gzip compression supporte
 
 ## Learn More
 
-- [Sending data from your app](docs/sending-data.md)
-- [Querying Parquet files](docs/querying.md)
-- [Configuration reference](docs/reference.md)
-- [Full deployment guide](docs/deploying.md)
+- [Sending data from your app](https://smithclay.github.io/otlp2parquet/sending-data/)
+- [Querying Parquet files](https://smithclay.github.io/otlp2parquet/querying/)
+- [Configuration reference](https://smithclay.github.io/otlp2parquet/reference/)
+- [Full deployment guide](https://smithclay.github.io/otlp2parquet/deploying/)
 
 ---
 
