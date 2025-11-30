@@ -21,7 +21,7 @@ pub mod types;
 
 // Re-export commonly used types
 pub use otlp::{InputFormat, LogMetadata};
-pub use schema::otel_logs_schema;
+pub use schema::{otel_logs_schema, otel_metrics_gauge_schema};
 pub use types::{Blake3Hash, ParquetWriteResult, SignalType};
 
 /// Parse OTLP log data and convert to Arrow RecordBatch
@@ -138,5 +138,79 @@ mod tests {
         assert_eq!(batch.num_rows(), 0);
         assert_eq!(metadata.service_name.as_ref(), "");
         assert_eq!(metadata.record_count, 0);
+    }
+}
+
+// WASM bindings for browser usage
+#[cfg(feature = "wasm")]
+pub mod wasm {
+    use super::*;
+    use wasm_bindgen::prelude::*;
+
+    /// Convert OTLP JSON logs to Arrow IPC bytes
+    ///
+    /// Input: JSON string in OTLP ExportLogsServiceRequest format
+    /// Output: Arrow IPC stream bytes (can be loaded by DuckDB)
+    #[wasm_bindgen]
+    pub fn logs_json_to_arrow_ipc(otlp_json: &str) -> std::result::Result<Vec<u8>, JsError> {
+        let (batch, _metadata) = parse_otlp_to_arrow(otlp_json.as_bytes(), InputFormat::Json)
+            .map_err(|e| JsError::new(&e.to_string()))?;
+
+        batch_to_ipc_bytes(&batch).map_err(|e| JsError::new(&e.to_string()))
+    }
+
+    /// Convert OTLP JSON traces to Arrow IPC bytes
+    #[wasm_bindgen]
+    pub fn traces_json_to_arrow_ipc(otlp_json: &str) -> std::result::Result<Vec<u8>, JsError> {
+        use otlp::traces;
+
+        let request = traces::parse_otlp_trace_request(otlp_json.as_bytes(), InputFormat::Json)
+            .map_err(|e| JsError::new(&e.to_string()))?;
+
+        let (batches, _metadata) = traces::TraceArrowConverter::convert(&request)
+            .map_err(|e| JsError::new(&e.to_string()))?;
+
+        // Return the first batch (demo assumes single batch)
+        let batch = batches
+            .into_iter()
+            .next()
+            .ok_or_else(|| JsError::new("No batches produced from trace conversion"))?;
+
+        batch_to_ipc_bytes(&batch).map_err(|e| JsError::new(&e.to_string()))
+    }
+
+    /// Convert OTLP JSON metrics to Arrow IPC bytes (returns gauge data only for demo)
+    #[wasm_bindgen]
+    pub fn metrics_json_to_arrow_ipc(otlp_json: &str) -> std::result::Result<Vec<u8>, JsError> {
+        use otlp::metrics;
+
+        let request = metrics::parse_otlp_request(otlp_json.as_bytes(), InputFormat::Json)
+            .map_err(|e| JsError::new(&e.to_string()))?;
+
+        let converter = metrics::ArrowConverter::new();
+        let (batches, _metadata) = converter
+            .convert(request)
+            .map_err(|e| JsError::new(&e.to_string()))?;
+
+        // Return gauge batch if available, otherwise empty
+        if let Some((_, batch)) = batches.into_iter().find(|(name, _)| name == "gauge") {
+            batch_to_ipc_bytes(&batch).map_err(|e| JsError::new(&e.to_string()))
+        } else {
+            // Return empty batch with gauge schema
+            let schema = crate::schema::otel_metrics_gauge_schema();
+            let empty = RecordBatch::new_empty(std::sync::Arc::new(schema));
+            batch_to_ipc_bytes(&empty).map_err(|e| JsError::new(&e.to_string()))
+        }
+    }
+
+    fn batch_to_ipc_bytes(batch: &RecordBatch) -> Result<Vec<u8>> {
+        use arrow::ipc::writer::StreamWriter;
+        let mut buf = Vec::new();
+        {
+            let mut writer = StreamWriter::try_new(&mut buf, &batch.schema())?;
+            writer.write(batch)?;
+            writer.finish()?;
+        }
+        Ok(buf)
     }
 }
