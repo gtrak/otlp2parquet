@@ -66,10 +66,14 @@ pub fn run(args: CloudflareArgs) -> Result<()> {
                 .map_err(|e| anyhow::anyhow!("Invalid bucket name: {}", e))?;
             bucket
         }
-        None => Input::new()
-            .with_prompt("R2 bucket name")
-            .validate_with(validate_bucket_name)
-            .interact_text()?,
+        None => {
+            let default_bucket = format!("{}-data", worker_name);
+            Input::new()
+                .with_prompt("R2 bucket name")
+                .default(default_bucket)
+                .validate_with(validate_bucket_name)
+                .interact_text()?
+        }
     };
 
     let account_id = match args.account_id {

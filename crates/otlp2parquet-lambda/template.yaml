@@ -36,7 +36,7 @@ Conditions:
 Globals:
   Function:
     Timeout: 30
-    MemorySize: 512
+    MemorySize: 256
     Runtime: provided.al2023  # Custom runtime for Rust
     Architectures:
       - arm64  # Graviton2 - 20% cheaper and faster for Rust
