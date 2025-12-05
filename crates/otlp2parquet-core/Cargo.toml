@@ -41,7 +41,7 @@ toml = { workspace = true }
 tracing = { workspace = true }
 
 # WASM bindings (optional)
-wasm-bindgen = { version = "0.2", optional = true }
+wasm-bindgen = { version = "0.2.106", optional = true }
 getrandom = { version = "0.2", optional = true }
 
 [target.'cfg(target_family = "wasm")'.dependencies]
