@@ -32,7 +32,8 @@ struct Cli {
 #[derive(Subcommand)]
 enum Commands {
     /// Generate deployment configuration for cloud platforms
-    Deploy {
+    #[command(alias = "deploy")]
+    Create {
         #[command(subcommand)]
         platform: otlp2parquet::deploy::DeployCommand,
     },
@@ -49,7 +50,7 @@ fn main() -> Result<()> {
     let cli = Cli::parse();
 
     match cli.command {
-        Some(Commands::Deploy { platform }) => platform.run(),
+        Some(Commands::Create { platform }) => platform.run(),
         Some(Commands::Connect { service }) => run_connect(service),
         Some(Commands::Serve) | None => run_server(cli),
     }

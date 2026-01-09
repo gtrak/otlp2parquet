@@ -79,7 +79,7 @@ Once you've kicked the tires locally, deploy to serverless:
 **Cloudflare Workers + R2 with [wrangler](https://developers.cloudflare.com/workers/wrangler/install-and-update/) CLI:**
 ```bash
 # Generates config for workers
-otlp2parquet deploy cloudflare
+otlp2parquet create cloudflare
 
 # Deploy to Cloudflare
 wrangler deploy
@@ -88,7 +88,7 @@ wrangler deploy
 **AWS Lambda + S3 with [AWS CLI](https://aws.amazon.com/cli/):**
 ```bash
 # Generates a Cloudformation template for Lambda + S3
-otlp2parquet deploy aws
+otlp2parquet create aws
 
 # Deploy with Cloudformation
 aws cloudformation deploy --template-file template.yaml --stack-name otlp2parquet --capabilities CAPABILITY_IAM

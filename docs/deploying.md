@@ -1,6 +1,6 @@
 # Deploy
 
-Deploy otlp2parquet to Cloudflare Workers, AWS Lambda, or run locally with Docker.
+Create and deploy otlp2parquet to Cloudflare Workers, AWS Lambda, or run locally with Docker.
 
 ## Prerequisites
 
@@ -21,7 +21,7 @@ Deploy to Cloudflare's edge network with R2 storage.
 ### Quick Start
 
 ```bash
-otlp2parquet deploy cloudflare
+otlp2parquet create cloudflare
 ```
 
 The wizard prompts for:
@@ -53,7 +53,7 @@ curl -X POST https://your-worker.workers.dev/v1/logs \
 
 ??? note "Non-interactive mode (CI/CD)"
     ```bash
-    otlp2parquet deploy cloudflare \
+    otlp2parquet create cloudflare \
       --worker-name my-worker \
       --bucket my-logs \
       --account-id abc123def456... \
@@ -155,7 +155,7 @@ Deploy to AWS Lambda with S3 storage.
 
 ```bash
 # Generates a CloudFormation template for Lambda + S3
-otlp2parquet deploy aws
+otlp2parquet create aws
 
 # Deploy with CloudFormation
 aws cloudformation deploy --template-file template.yaml --stack-name otlp2parquet --capabilities CAPABILITY_IAM
@@ -189,7 +189,7 @@ aws cloudformation describe-stacks \
 
 ??? note "Non-interactive mode (CI/CD)"
     ```bash
-    otlp2parquet deploy aws \
+    otlp2parquet create aws \
       --stack-name my-stack \
       --bucket my-data \
       --force
@@ -207,7 +207,7 @@ aws cloudformation describe-stacks \
     aws s3 cp target/lambda/bootstrap-arm64.zip s3://my-bucket/
 
     # Generate template with custom S3 URI
-    otlp2parquet deploy aws --lambda-s3-uri s3://my-bucket/bootstrap-arm64.zip
+    otlp2parquet create aws --lambda-s3-uri s3://my-bucket/bootstrap-arm64.zip
     ```
 
 ??? warning "Production considerations"

@@ -19,8 +19,8 @@ Deploy in under 5 minutes:
 cargo install otlp2parquet
 
 # Deploy to your platform
-otlp2parquet deploy cloudflare
-otlp2parquet deploy aws
+otlp2parquet create cloudflare
+otlp2parquet create aws
 ```
 
 Or run locally with Docker:
