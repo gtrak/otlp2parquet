@@ -5,12 +5,12 @@ edition.workspace = true
 authors.workspace = true
 license.workspace = true
 repository.workspace = true
-publish = false
+description.workspace = true
 
 [dependencies]
 otlp2parquet-common = { workspace = true }
 otlp2records = { workspace = true }
-otlp2parquet-writer = { path = "../otlp2parquet-writer", default-features = false }
+otlp2parquet-writer = { workspace = true }
 tracing = { workspace = true }
 
 [dev-dependencies]

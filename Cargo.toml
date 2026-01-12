@@ -41,6 +41,7 @@ opt-level = 3
 # Internal crates - all use workspace version
 otlp2parquet-common = { version = "0.7.0", path = "crates/otlp2parquet-common" }
 otlp2parquet-writer = { version = "0.7.0", path = "crates/otlp2parquet-writer" }
+otlp2parquet-handlers = { version = "0.7.0", path = "crates/otlp2parquet-handlers" }
 otlp2records = { version = "0.1.1", default-features = false }
 
 # Arrow/Parquet - MINIMAL features only
