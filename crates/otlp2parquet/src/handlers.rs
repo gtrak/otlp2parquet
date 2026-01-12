@@ -2,8 +2,6 @@
 //
 // Implements OTLP ingestion and health check endpoints
 
-use anyhow::Context;
-use arrow::array::{Array, RecordBatch, TimestampNanosecondArray};
 use axum::{
     extract::State,
     http::{HeaderMap, StatusCode},
@@ -11,31 +9,18 @@ use axum::{
     Json,
 };
 use metrics::{counter, histogram};
-use otlp2parquet_core::batch::CompletedBatch;
-use otlp2parquet_core::{otlp, InputFormat};
-use prost::Message;
+use otlp2parquet_common::{InputFormat, MetricType, SignalType};
+
+use crate::batch::CompletedBatch;
+use otlp2parquet_handlers::{
+    decode_logs_partitioned, decode_metrics_partitioned, decode_traces_partitioned,
+    report_skipped_metrics, ServiceGroupedBatches,
+};
 use serde_json::json;
 use std::time::Instant;
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
 use crate::{AppError, AppState};
-
-#[derive(Copy, Clone, Debug, Eq, PartialEq)]
-enum SignalKind {
-    Logs,
-    Traces,
-    Metrics,
-}
-
-impl SignalKind {
-    fn as_str(&self) -> &'static str {
-        match self {
-            SignalKind::Logs => "logs",
-            SignalKind::Traces => "traces",
-            SignalKind::Metrics => "metrics",
-        }
-    }
-}
 
 /// POST /v1/logs - OTLP log ingestion endpoint
 pub(crate) async fn handle_logs(
@@ -43,16 +28,16 @@ pub(crate) async fn handle_logs(
     headers: HeaderMap,
     body: axum::body::Bytes,
 ) -> Result<Response, AppError> {
-    handle_signal(SignalKind::Logs, &state, headers, body).await
+    handle_signal(SignalType::Logs, &state, headers, body).await
 }
 
-/// POST /v1/traces - OTLP trace ingestion endpoint (stub)
+/// POST /v1/traces - OTLP trace ingestion endpoint
 pub(crate) async fn handle_traces(
     State(state): State<AppState>,
     headers: HeaderMap,
     body: axum::body::Bytes,
 ) -> Result<Response, AppError> {
-    handle_signal(SignalKind::Traces, &state, headers, body).await
+    handle_signal(SignalType::Traces, &state, headers, body).await
 }
 
 /// POST /v1/metrics - OTLP metrics ingestion endpoint
@@ -61,7 +46,7 @@ pub(crate) async fn handle_metrics(
     headers: HeaderMap,
     body: axum::body::Bytes,
 ) -> Result<Response, AppError> {
-    handle_signal(SignalKind::Metrics, &state, headers, body).await
+    handle_signal(SignalType::Metrics, &state, headers, body).await
 }
 
 /// GET /health - Basic health check
@@ -71,13 +56,11 @@ pub(crate) async fn health_check() -> impl IntoResponse {
 
 /// GET /ready - Readiness check
 pub(crate) async fn ready_check(State(_state): State<AppState>) -> impl IntoResponse {
-    // Writer is always ready after initialization
-    // TODO: Add actual health checks if needed (e.g., test write to storage)
     (StatusCode::OK, Json(json!({"status": "ready"})))
 }
 
 async fn handle_signal(
-    signal: SignalKind,
+    signal: SignalType,
     state: &AppState,
     headers: HeaderMap,
     body: axum::body::Bytes,
@@ -103,9 +86,9 @@ async fn handle_signal(
     }
 
     match signal {
-        SignalKind::Logs => process_logs(state, format, body).await,
-        SignalKind::Traces => process_traces(state, format, body).await,
-        SignalKind::Metrics => process_metrics(state, format, body).await,
+        SignalType::Logs => process_logs(state, format, body).await,
+        SignalType::Traces => process_traces(format, body).await,
+        SignalType::Metrics => process_metrics(format, body).await,
     }
 }
 
@@ -115,69 +98,145 @@ async fn process_logs(
     body: axum::body::Bytes,
 ) -> Result<Response, AppError> {
     let start = Instant::now();
+    let body_len = body.len();
     counter!("otlp.ingest.requests", 1);
-    histogram!("otlp.ingest.bytes", body.len() as f64);
+    histogram!("otlp.ingest.bytes", body_len as f64);
 
     let parse_start = Instant::now();
-    let request = otlp::parse_otlp_request(&body, format)
-        .map_err(|e| AppError::bad_request(e.context("Failed to parse OTLP request payload")))?;
+    let grouped = decode_logs_partitioned(&body, format).map_err(|e| {
+        AppError::bad_request(anyhow::anyhow!("Failed to parse OTLP logs request: {}", e))
+    })?;
     debug!(
         elapsed_us = parse_start.elapsed().as_micros() as u64,
         signal = "logs",
+        records = grouped.total_records,
         "parse"
     );
 
-    let per_service_requests = otlp::logs::split_request_by_service(request);
-    let mut uploads: Vec<CompletedBatch<otlp::LogMetadata>> = Vec::new();
-    let mut total_records: usize = 0;
-
-    let convert_start = Instant::now();
-    if let Some(batcher) = &state.batcher {
-        let mut expired = batcher
-            .drain_expired()
-            .map_err(|e| AppError::internal(e.context("Failed to flush expired batches")))?;
-        uploads.append(&mut expired);
-
-        for subset in &per_service_requests {
-            let approx_bytes = subset.encoded_len();
-            let (mut ready, meta) = batcher
-                .ingest(subset, approx_bytes)
-                .map_err(|e| AppError::internal(e.context("Failed to enqueue batch")))?;
-            total_records += meta.record_count;
-            uploads.append(&mut ready);
-        }
+    // Use batching if enabled, otherwise write directly
+    if let Some(ref batcher) = state.batcher {
+        process_logs_batched(batcher, grouped, body_len, start).await
     } else {
-        for subset in per_service_requests {
-            let batch = state
-                .passthrough
-                .ingest(&subset)
-                .map_err(|e| AppError::bad_request(e.context("Failed to convert OTLP to Arrow")))?;
-            total_records += batch.metadata.record_count;
-            uploads.push(batch);
+        process_logs_direct(grouped, start).await
+    }
+}
+
+/// Process logs with batching - accumulate in memory, flush when thresholds hit
+async fn process_logs_batched(
+    batcher: &crate::batch::BatchManager,
+    grouped: otlp2parquet_handlers::ServiceGroupedBatches,
+    body_len: usize,
+    start: Instant,
+) -> Result<Response, AppError> {
+    let mut total_records: usize = 0;
+    let mut buffered_records: usize = 0;
+    let mut flushed_paths = Vec::new();
+
+    // Approximate bytes per batch (distribute body size across batches)
+    let batch_count = grouped.batches.len().max(1);
+    let approx_bytes_per_batch = body_len / batch_count;
+
+    let write_start = Instant::now();
+    for pb in grouped.batches {
+        if pb.batch.num_rows() == 0 {
+            continue;
+        }
+
+        total_records += pb.record_count;
+        counter!("otlp.ingest.records", pb.record_count as u64);
+
+        // Ingest into batcher - may return completed batches if thresholds hit
+        let (completed, _metadata) = batcher
+            .ingest(&pb, approx_bytes_per_batch)
+            .map_err(|e| AppError::internal(anyhow::anyhow!("Batch ingestion failed: {}", e)))?;
+
+        if completed.is_empty() {
+            // Records buffered, not yet flushed
+            buffered_records += pb.record_count;
+            debug!(
+                service = %pb.service_name,
+                records = pb.record_count,
+                "Buffered logs"
+            );
+        } else {
+            // Thresholds hit - flush completed batches
+            for batch in completed {
+                let paths = persist_log_batch(&batch).await.map_err(|e| {
+                    AppError::internal(anyhow::anyhow!("Failed to flush batch: {}", e))
+                })?;
+
+                for path in &paths {
+                    info!(
+                        path = %path,
+                        service = %batch.metadata.service_name,
+                        rows = batch.metadata.record_count,
+                        "Flushed batch (threshold)"
+                    );
+                }
+                flushed_paths.extend(paths);
+            }
         }
     }
+
     debug!(
-        elapsed_us = convert_start.elapsed().as_micros() as u64,
+        elapsed_us = write_start.elapsed().as_micros() as u64,
         signal = "logs",
-        "convert"
+        "batch_ingest"
     );
 
-    counter!("otlp.ingest.records", total_records as u64);
+    histogram!(
+        "otlp.ingest.latency_ms",
+        start.elapsed().as_secs_f64() * 1000.0
+    );
 
+    let response = Json(json!({
+        "status": "ok",
+        "mode": "batched",
+        "records_processed": total_records,
+        "records_buffered": buffered_records,
+        "flush_count": flushed_paths.len(),
+        "partitions": flushed_paths,
+    }));
+
+    Ok((StatusCode::OK, response).into_response())
+}
+
+/// Process logs directly - write each batch immediately (no batching)
+async fn process_logs_direct(
+    grouped: otlp2parquet_handlers::ServiceGroupedBatches,
+    start: Instant,
+) -> Result<Response, AppError> {
     let mut uploaded_paths = Vec::new();
+    let mut total_records: usize = 0;
+
     let write_start = Instant::now();
-    for completed in uploads {
-        let partition_paths = persist_log_batch(state, &completed)
-            .await
-            .map_err(AppError::internal)?;
+    for pb in grouped.batches {
+        if pb.batch.num_rows() == 0 {
+            continue;
+        }
+
+        total_records += pb.record_count;
+        counter!("otlp.ingest.records", pb.record_count as u64);
+
+        let path = otlp2parquet_writer::write_batch(otlp2parquet_writer::WriteBatchRequest {
+            batch: &pb.batch,
+            signal_type: SignalType::Logs,
+            metric_type: None,
+            service_name: &pb.service_name,
+            timestamp_micros: pb.min_timestamp_micros,
+        })
+        .await
+        .map_err(|e| {
+            AppError::internal(anyhow::anyhow!("Failed to write logs to storage: {}", e))
+        })?;
 
         counter!("otlp.batch.flushes", 1);
-        histogram!("otlp.batch.rows", completed.metadata.record_count as f64);
+        histogram!("otlp.batch.rows", pb.record_count as f64);
         info!(
-            "Committed batch paths={:?} service={} rows={}",
-            partition_paths, completed.metadata.service_name, completed.metadata.record_count
+            "Committed batch path={} service={} rows={}",
+            path, pb.service_name, pb.record_count
         );
-        uploaded_paths.extend(partition_paths);
+        uploaded_paths.push(path);
     }
     debug!(
         elapsed_us = write_start.elapsed().as_micros() as u64,
@@ -192,6 +251,7 @@ async fn process_logs(
 
     let response = Json(json!({
         "status": "ok",
+        "mode": "direct",
         "records_processed": total_records,
         "flush_count": uploaded_paths.len(),
         "partitions": uploaded_paths,
@@ -201,7 +261,6 @@ async fn process_logs(
 }
 
 async fn process_traces(
-    _state: &AppState,
     format: InputFormat,
     body: axum::body::Bytes,
 ) -> Result<Response, AppError> {
@@ -209,81 +268,55 @@ async fn process_traces(
     counter!("otlp.ingest.requests", 1, "signal" => "traces");
     histogram!("otlp.ingest.bytes", body.len() as f64, "signal" => "traces");
 
-    // Parse OTLP traces request
     let parse_start = Instant::now();
-    let request = otlp::traces::parse_otlp_trace_request(&body, format).map_err(|e| {
-        AppError::bad_request(e.context("Failed to parse OTLP traces request payload"))
+    let grouped = decode_traces_partitioned(&body, format).map_err(|e| {
+        AppError::bad_request(anyhow::anyhow!(
+            "Failed to parse OTLP traces request: {}",
+            e
+        ))
     })?;
     debug!(
         elapsed_us = parse_start.elapsed().as_micros() as u64,
         signal = "traces",
+        spans = grouped.total_records,
         "parse"
     );
 
-    let per_service_requests = otlp::traces::split_request_by_service(request);
     let mut uploaded_paths = Vec::new();
     let mut spans_processed: usize = 0;
-    let mut all_batches = Vec::new();
 
-    let convert_start = Instant::now();
-    for subset in per_service_requests {
-        let (batches, metadata) =
-            otlp::traces::TraceArrowConverter::convert(&subset).map_err(|e| {
-                AppError::bad_request(e.context("Failed to convert OTLP traces to Arrow"))
-            })?;
-
-        if batches.is_empty() || metadata.span_count == 0 {
+    let write_start = Instant::now();
+    for pb in grouped.batches {
+        if pb.batch.num_rows() == 0 {
             continue;
         }
 
-        spans_processed += metadata.span_count;
+        spans_processed += pb.record_count;
         counter!(
             "otlp.ingest.records",
-            metadata.span_count as u64,
+            pb.record_count as u64,
             "signal" => "traces"
         );
 
-        all_batches.push((batches, metadata));
-    }
-    debug!(
-        elapsed_us = convert_start.elapsed().as_micros() as u64,
-        signal = "traces",
-        "convert"
-    );
-
-    let write_start = Instant::now();
-    for (batches, metadata) in all_batches {
-        let service_name = metadata.service_name.as_ref();
-
-        // Write traces via write_batch function
-        let mut partition_paths = Vec::new();
-        for batch in &batches {
-            let path = otlp2parquet_writer::write_batch(otlp2parquet_writer::WriteBatchRequest {
-                batch,
-                signal_type: otlp2parquet_core::SignalType::Traces,
-                metric_type: None,
-                service_name,
-                timestamp_micros: metadata.first_timestamp_micros,
-            })
-            .await
-            .map_err(|e| {
-                AppError::internal(anyhow::anyhow!("Failed to write traces to storage: {}", e))
-            })?;
-
-            partition_paths.push(path);
-        }
+        let path = otlp2parquet_writer::write_batch(otlp2parquet_writer::WriteBatchRequest {
+            batch: &pb.batch,
+            signal_type: SignalType::Traces,
+            metric_type: None,
+            service_name: &pb.service_name,
+            timestamp_micros: pb.min_timestamp_micros,
+        })
+        .await
+        .map_err(|e| {
+            AppError::internal(anyhow::anyhow!("Failed to write traces to storage: {}", e))
+        })?;
 
         counter!("otlp.traces.flushes", 1);
-        histogram!(
-            "otlp.batch.rows",
-            metadata.span_count as f64,
-            "signal" => "traces"
-        );
+        histogram!("otlp.batch.rows", pb.record_count as f64, "signal" => "traces");
         info!(
-            "Committed traces batch paths={:?} service={} spans={}",
-            partition_paths, service_name, metadata.span_count
+            "Committed traces batch path={} service={} spans={}",
+            path, pb.service_name, pb.record_count
         );
-        uploaded_paths.extend(partition_paths);
+        uploaded_paths.push(path);
     }
     debug!(
         elapsed_us = write_start.elapsed().as_micros() as u64,
@@ -318,7 +351,6 @@ async fn process_traces(
 }
 
 async fn process_metrics(
-    _state: &AppState,
     format: InputFormat,
     body: axum::body::Bytes,
 ) -> Result<Response, AppError> {
@@ -326,80 +358,31 @@ async fn process_metrics(
     counter!("otlp.ingest.requests", 1, "signal" => "metrics");
     histogram!("otlp.ingest.bytes", body.len() as f64, "signal" => "metrics");
 
-    // Parse OTLP metrics request
     let parse_start = Instant::now();
-    let request = otlp::metrics::parse_otlp_request(&body, format).map_err(|e| {
-        AppError::bad_request(e.context("Failed to parse OTLP metrics request payload"))
+    let partitioned = decode_metrics_partitioned(&body, format).map_err(|e| {
+        AppError::bad_request(anyhow::anyhow!(
+            "Failed to parse OTLP metrics request: {}",
+            e
+        ))
     })?;
+    report_skipped_metrics(&partitioned.skipped);
     debug!(
         elapsed_us = parse_start.elapsed().as_micros() as u64,
         signal = "metrics",
+        gauge_batches = partitioned.gauge.len(),
+        sum_batches = partitioned.sum.len(),
         "parse"
     );
 
-    let per_service_requests = otlp::metrics::split_request_by_service(request);
-    let converter = otlp::metrics::ArrowConverter::new();
-    let mut aggregated = otlp::metrics::MetricsMetadata::default();
-    let mut all_batches = Vec::new();
-
-    let convert_start = Instant::now();
-    for subset in per_service_requests {
-        let (batches_by_type, subset_metadata) = converter.convert(subset).map_err(|e| {
-            AppError::bad_request(e.context("Failed to convert OTLP metrics to Arrow"))
-        })?;
-
-        aggregated.resource_metrics_count += subset_metadata.resource_metrics_count;
-        aggregated.scope_metrics_count += subset_metadata.scope_metrics_count;
-        aggregated.gauge_count += subset_metadata.gauge_count;
-        aggregated.sum_count += subset_metadata.sum_count;
-        aggregated.histogram_count += subset_metadata.histogram_count;
-        aggregated.exponential_histogram_count += subset_metadata.exponential_histogram_count;
-        aggregated.summary_count += subset_metadata.summary_count;
-
-        all_batches.push((batches_by_type, subset_metadata));
-    }
-    debug!(
-        elapsed_us = convert_start.elapsed().as_micros() as u64,
-        signal = "metrics",
-        "convert"
-    );
-
-    let mut uploaded_paths = Vec::new();
+    let gauge_count = partitioned.gauge.total_records;
+    let sum_count = partitioned.sum.total_records;
 
     let write_start = Instant::now();
-    for (batches_by_type, subset_metadata) in all_batches {
-        let service_name = subset_metadata.service_name().to_string();
+    let mut uploaded_paths = Vec::new();
 
-        for (metric_type, batch) in batches_by_type {
-            let timestamp_nanos = subset_metadata
-                .first_timestamp_for(&metric_type)
-                .unwrap_or_else(|| extract_first_timestamp(&batch));
+    uploaded_paths.extend(write_metric_batches(MetricType::Gauge, partitioned.gauge).await?);
+    uploaded_paths.extend(write_metric_batches(MetricType::Sum, partitioned.sum).await?);
 
-            let partition_path =
-                otlp2parquet_writer::write_batch(otlp2parquet_writer::WriteBatchRequest {
-                    batch: &batch,
-                    signal_type: otlp2parquet_core::SignalType::Metrics,
-                    metric_type: Some(&metric_type),
-                    service_name: &service_name,
-                    timestamp_micros: timestamp_nanos,
-                })
-                .await
-                .map_err(|e| {
-                    AppError::internal(anyhow::anyhow!(
-                        "Failed to write {} metrics: {}",
-                        metric_type,
-                        e
-                    ))
-                })?;
-
-            counter!("otlp.metrics.flushes", 1, "metric_type" => metric_type.clone());
-            info!(
-                "Committed metrics batch path={} metric_type={} service={}",
-                partition_path, metric_type, service_name
-            );
-            uploaded_paths.push(partition_path);
-        }
-    }
     debug!(
         elapsed_us = write_start.elapsed().as_micros() as u64,
         signal = "metrics",
@@ -417,11 +400,11 @@ async fn process_metrics(
             .into_response());
     }
 
-    let total_data_points = aggregated.gauge_count
-        + aggregated.sum_count
-        + aggregated.histogram_count
-        + aggregated.exponential_histogram_count
-        + aggregated.summary_count;
+    let total_data_points = gauge_count
+        + sum_count
+        + partitioned.skipped.histograms
+        + partitioned.skipped.exponential_histograms
+        + partitioned.skipped.summaries;
 
     counter!(
         "otlp.ingest.records",
@@ -437,74 +420,97 @@ async fn process_metrics(
 
     let response = Json(json!({
         "status": "ok",
-        "data_points_processed": total_data_points,
-        "gauge_count": aggregated.gauge_count,
-        "sum_count": aggregated.sum_count,
-        "histogram_count": aggregated.histogram_count,
-        "exponential_histogram_count": aggregated.exponential_histogram_count,
-        "summary_count": aggregated.summary_count,
+        "data_points_processed": gauge_count + sum_count,
+        "gauge_count": gauge_count,
+        "sum_count": sum_count,
+        "histogram_count": partitioned.skipped.histograms,
+        "exponential_histogram_count": partitioned.skipped.exponential_histograms,
+        "summary_count": partitioned.skipped.summaries,
         "partitions": uploaded_paths,
     }));
 
     Ok((StatusCode::OK, response).into_response())
 }
 
+async fn write_metric_batches(
+    metric_type: MetricType,
+    grouped: ServiceGroupedBatches,
+) -> Result<Vec<String>, AppError> {
+    if grouped.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    // Validate supported metric types
+    match metric_type {
+        MetricType::Gauge | MetricType::Sum => {}
+        _ => {
+            warn!(
+                metric_type = ?metric_type,
+                count = grouped.total_records,
+                "Unsupported metric type - data not persisted"
+            );
+            return Ok(Vec::new());
+        }
+    };
+
+    let mut paths = Vec::new();
+
+    for pb in grouped.batches {
+        if pb.batch.num_rows() == 0 {
+            continue;
+        }
+
+        let path = otlp2parquet_writer::write_batch(otlp2parquet_writer::WriteBatchRequest {
+            batch: &pb.batch,
+            signal_type: SignalType::Metrics,
+            metric_type: Some(metric_type.as_str()),
+            service_name: &pb.service_name,
+            timestamp_micros: pb.min_timestamp_micros,
+        })
+        .await
+        .map_err(|e| {
+            AppError::internal(anyhow::anyhow!(
+                "Failed to write {} metrics: {}",
+                metric_type,
+                e
+            ))
+        })?;
+
+        counter!("otlp.metrics.flushes", 1, "metric_type" => metric_type.as_str());
+        info!(
+            "Committed metrics batch path={} metric_type={} service={} points={}",
+            path, metric_type, pb.service_name, pb.record_count
+        );
+        paths.push(path);
+    }
+
+    Ok(paths)
+}
+
+/// Persist a completed batch from the BatchManager to storage.
+/// Used by background flush and shutdown handlers.
 pub(crate) async fn persist_log_batch(
-    _state: &AppState,
-    completed: &CompletedBatch<otlp::LogMetadata>,
-) -> anyhow::Result<Vec<String>> {
-    let mut uploaded_paths = Vec::new();
+    completed: &CompletedBatch,
+) -> Result<Vec<String>, anyhow::Error> {
+    let mut paths = Vec::new();
 
     for batch in &completed.batches {
+        if batch.num_rows() == 0 {
+            continue;
+        }
+
         let path = otlp2parquet_writer::write_batch(otlp2parquet_writer::WriteBatchRequest {
             batch,
-            signal_type: otlp2parquet_core::SignalType::Logs,
+            signal_type: SignalType::Logs,
             metric_type: None,
             service_name: &completed.metadata.service_name,
             timestamp_micros: completed.metadata.first_timestamp_micros,
         })
-        .await
-        .context("Failed to write logs to storage")?;
+        .await?;
 
-        uploaded_paths.push(path);
+        counter!("otlp.batch.flushes", 1);
+        paths.push(path);
     }
 
-    Ok(uploaded_paths)
-}
-
-fn extract_first_timestamp(batch: &RecordBatch) -> i64 {
-    // Support both nanos and micros; always return microsecond precision.
-    let mut min_micros = i64::MAX;
-
-    if let Some(array) = batch
-        .column(0)
-        .as_any()
-        .downcast_ref::<TimestampNanosecondArray>()
-    {
-        for idx in 0..array.len() {
-            if array.is_valid(idx) {
-                min_micros = min_micros.min(array.value(idx) / 1_000);
-            }
-        }
-    }
-
-    if min_micros == i64::MAX {
-        if let Some(array) = batch
-            .column(0)
-            .as_any()
-            .downcast_ref::<arrow::array::TimestampMicrosecondArray>()
-        {
-            for idx in 0..array.len() {
-                if array.is_valid(idx) {
-                    min_micros = min_micros.min(array.value(idx));
-                }
-            }
-        }
-    }
-
-    if min_micros == i64::MAX {
-        0
-    } else {
-        min_micros
-    }
+    Ok(paths)
 }

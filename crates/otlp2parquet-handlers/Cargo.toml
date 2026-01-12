@@ -8,9 +8,12 @@ repository.workspace = true
 publish = false
 
 [dependencies]
-arrow = { version = "56", default-features = false }
-otlp2parquet-core = { path = "../otlp2parquet-core", default-features = false }
+otlp2parquet-common = { workspace = true }
+otlp2records = { workspace = true }
 otlp2parquet-writer = { path = "../otlp2parquet-writer", default-features = false }
+tracing = { workspace = true }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["macros", "rt"] }
+bytes = { version = "1", default-features = false }
+ordered-float = "4"

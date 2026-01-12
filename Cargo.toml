@@ -1,7 +1,7 @@
 [workspace]
 members = [
     "crates/otlp2parquet",
-    "crates/otlp2parquet-core",
+    "crates/otlp2parquet-common",
     "crates/otlp2parquet-writer",
     "crates/otlp2parquet-proto",
     "crates/otlp2parquet-cloudflare",
@@ -29,9 +29,6 @@ panic = "abort"           # Smaller panic handler
 [profile.release.package."*"]
 opt-level = "z"
 
-[profile.release.package.otlp2parquet-core]
-opt-level = 3
-
 [profile.release.package.otlp2parquet-cloudflare]
 opt-level = "z"
 
@@ -44,12 +41,14 @@ opt-level = 3
 [workspace.dependencies]
 # Internal crates - all use workspace version
 otlp2parquet-proto = { version = "0.6.0", path = "crates/otlp2parquet-proto" }
-otlp2parquet-core = { version = "0.6.0", path = "crates/otlp2parquet-core" }
+otlp2parquet-common = { version = "0.6.0", path = "crates/otlp2parquet-common" }
 otlp2parquet-writer = { version = "0.6.0", path = "crates/otlp2parquet-writer" }
+otlp2records = { git = "https://github.com/smithclay/otlp2records", rev = "66e88fdc006acb63fe57b600f2ff25a3c841dea7", default-features = false }
 
 # Arrow/Parquet - MINIMAL features only
-arrow = { version = "56.2", default-features = false, features = ["ipc"] }
-parquet = { version = "56.2", default-features = false, features = ["snap", "arrow", "async"] }
+# Version pinned to 54 to match otlp2records dependency
+arrow = { version = "54", default-features = false, features = ["ipc"] }
+parquet = { version = "54", default-features = false, features = ["snap", "arrow", "async"] }
 
 # OTLP Protocol - minimal
 prost = { version = "0.14", default-features = false, features = ["std"] }
@@ -62,7 +61,6 @@ anyhow = "1"
 thiserror = "2.0"
 chrono = { version = "0.4", default-features = false, features = ["std"] }
 tokio = { version = "1", default-features = false, features = ["rt", "macros"] }
-blake3 = "1"
 once_cell = "1.19"
 hex = "0.4"
 base64 = "0.22"

@@ -20,9 +20,12 @@ use axum::{
     routing::{get, post},
     Json, Router,
 };
-use otlp2parquet_core::batch::{BatchConfig, BatchManager, PassthroughBatcher};
-use otlp2parquet_core::config::RuntimeConfig;
-use otlp2parquet_core::parquet::encoding::set_parquet_row_group_size;
+use otlp2parquet_common::config::RuntimeConfig;
+
+mod batch;
+
+use batch::{BatchConfig, BatchManager};
+use otlp2parquet_writer::set_parquet_row_group_size;
 use serde_json::json;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -45,7 +48,6 @@ use init::init_writer;
 #[derive(Clone)]
 pub(crate) struct AppState {
     pub batcher: Option<Arc<BatchManager>>,
-    pub passthrough: PassthroughBatcher,
     pub max_payload_bytes: usize,
 }
 
@@ -180,7 +182,6 @@ pub async fn run_with_config(config: RuntimeConfig) -> Result<()> {
     // Create app state
     let state = AppState {
         batcher,
-        passthrough: PassthroughBatcher::default(),
         max_payload_bytes,
     };
 
@@ -262,7 +263,7 @@ async fn flush_pending_batches(state: &AppState) -> Result<()> {
         for completed in pending {
             let rows = completed.metadata.record_count;
             let service = completed.metadata.service_name.as_ref().to_string();
-            match handlers::persist_log_batch(state, &completed).await {
+            match handlers::persist_log_batch(&completed).await {
                 Ok(paths) => {
                     for path in paths {
                         info!(
@@ -308,7 +309,7 @@ async fn run_background_flush(state: AppState, shutdown: Arc<AtomicBool>, interv
                     for completed in expired {
                         let rows = completed.metadata.record_count;
                         let service = completed.metadata.service_name.as_ref().to_string();
-                        match handlers::persist_log_batch(&state, &completed).await {
+                        match handlers::persist_log_batch(&completed).await {
                             Ok(paths) => {
                                 for path in &paths {
                                     info!(

@@ -3,10 +3,10 @@
 //! Contains the main OTLP request handler and supporting functions.
 
 use crate::do_config::WorkerEnvSource;
-use crate::{auth, errors, handlers, ingest, TraceContext};
+use crate::{auth, errors, handlers, TraceContext};
 use flate2::read::GzDecoder;
 use once_cell::sync::OnceCell;
-use otlp2parquet_core::config::{Platform, RuntimeConfig};
+use otlp2parquet_common::config::{Platform, RuntimeConfig};
 use std::io::Read;
 use worker::*;
 
@@ -139,7 +139,7 @@ pub(crate) async fn handle(mut req: Request, env: Env, _ctx: Context) -> Result<
 
     let content_type_header = req.headers().get("content-type").ok().flatten();
     let content_type = content_type_header.as_deref();
-    let format = otlp2parquet_core::InputFormat::from_content_type(content_type);
+    let format = otlp2parquet_common::InputFormat::from_content_type(content_type);
     let content_encoding = req.headers().get("content-encoding").ok().flatten();
 
     let raw_body = req.bytes().await.map_err(|e| {
@@ -179,24 +179,7 @@ pub(crate) async fn handle(mut req: Request, env: Env, _ctx: Context) -> Result<
             .into_response(status_code);
     }
 
-    // Check if batching is enabled (DO-based batching for Workers)
-    let batching_enabled = config.batch.enabled;
-
-    // Route to batching or direct handler based on config
-    if batching_enabled {
-        let ctx = ingest::BatchContext {
-            env: &env,
-            request_id: &trace_ctx.request_id,
-            trace_ctx: &trace_ctx,
-        };
-        return match signal {
-            "logs" => ingest::handle_batched_logs(&ctx, &body_bytes, format).await,
-            "traces" => ingest::handle_batched_traces(&ctx, &body_bytes, format).await,
-            "metrics" => ingest::handle_batched_metrics(&ctx, &body_bytes, format).await,
-            _ => unreachable!("signal validated above"),
-        };
-    }
-
+    // Process signals directly - write to R2 per-request
     match signal {
         "logs" => {
             handlers::handle_logs_request(&body_bytes, format, content_type, &trace_ctx.request_id)
@@ -225,7 +208,7 @@ pub(crate) async fn handle(mut req: Request, env: Env, _ctx: Context) -> Result<
 }
 
 fn load_worker_config(env: &Env) -> Result<RuntimeConfig> {
-    use otlp2parquet_core::config::EnvSource;
+    use otlp2parquet_common::config::EnvSource;
 
     tracing::debug!("load_worker_config: starting");
     let provider = WorkerEnvSource { env };

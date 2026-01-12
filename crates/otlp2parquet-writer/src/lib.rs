@@ -8,12 +8,12 @@
 // error sizes on the error path.
 #![allow(clippy::result_large_err)]
 
+mod encoding;
 mod error;
 mod storage;
 mod write;
 
-pub use error::{redact_secret, ErrorCode, Result, WriterError};
+pub use encoding::set_parquet_row_group_size;
+pub use error::{Result, WriterError};
 pub use storage::{get_operator_clone, initialize_storage};
 pub use write::{write_batch, write_multi_batch, WriteBatchRequest, WriteMultiBatchRequest};
-
-pub use otlp2parquet_core;

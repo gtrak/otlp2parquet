@@ -8,7 +8,7 @@ use arrow::array::RecordBatch;
 use bytes::Bytes;
 #[cfg(not(target_family = "wasm"))]
 use futures::future::BoxFuture;
-use otlp2parquet_core::SignalType;
+use otlp2parquet_common::SignalType;
 #[cfg(target_family = "wasm")]
 use parquet::arrow::ArrowWriter;
 #[cfg(not(target_family = "wasm"))]
@@ -116,7 +116,7 @@ async fn write_plain_parquet(
     let mut parquet_writer = AsyncArrowWriter::try_new(
         async_writer,
         batch.schema(),
-        Some(otlp2parquet_core::parquet::encoding::writer_properties().clone()),
+        Some(crate::encoding::writer_properties().clone()),
     )
     .map_err(|e| WriterError::write_failure(format!("Failed to create Parquet writer: {}", e)))?;
 
@@ -186,7 +186,7 @@ async fn write_plain_parquet(
         let mut writer = ArrowWriter::try_new(
             &mut buffer,
             batch.schema(),
-            Some(otlp2parquet_core::parquet::encoding::writer_properties().clone()),
+            Some(crate::encoding::writer_properties().clone()),
         )
         .map_err(|e| {
             WriterError::write_failure(format!("Failed to create Parquet writer: {}", e))
@@ -284,7 +284,7 @@ async fn write_plain_parquet_multi(
         let mut writer = ArrowWriter::try_new(
             &mut buffer,
             expected_schema,
-            Some(otlp2parquet_core::parquet::encoding::writer_properties().clone()),
+            Some(crate::encoding::writer_properties().clone()),
         )
         .map_err(|e| {
             WriterError::write_failure(format!("Failed to create Parquet writer: {}", e))
@@ -533,81 +533,38 @@ mod tests {
 
     #[test]
     fn test_real_otlp_timestamp_from_testdata() {
-        // Parse actual OTLP logs from testdata to see what timestamp values we get
-        use otlp2parquet_core::otlp;
+        // Parse actual OTLP logs from testdata and verify timestamp column values
+        use arrow::array::TimestampMillisecondArray;
+        use otlp2records::{transform_logs, InputFormat};
 
         // Read the test data file
         let test_data =
             std::fs::read("../../testdata/logs.pb").expect("Failed to read testdata/logs.pb");
 
-        // Parse OTLP request
-        let request =
-            otlp::parse_otlp_request(&test_data, otlp2parquet_core::InputFormat::Protobuf)
-                .expect("Failed to parse OTLP request");
+        // Parse OTLP request to Arrow
+        let batch =
+            transform_logs(&test_data, InputFormat::Protobuf).expect("Failed to transform logs");
 
         println!("\n=== Real OTLP Test Data Analysis ===");
-        println!("Resource logs count: {}", request.resource_logs.len());
+        println!("Batch row count: {}", batch.num_rows());
 
-        // Get first resource logs
-        if let Some(resource_logs) = request.resource_logs.first() {
-            if let Some(scope_logs) = resource_logs.scope_logs.first() {
-                if let Some(log_record) = scope_logs.log_records.first() {
-                    let time_unix_nano = log_record.time_unix_nano;
+        // Extract the timestamp column (stored in milliseconds)
+        if let Some(ts_col) = batch.column_by_name("timestamp") {
+            if let Some(ts_array) = ts_col.as_any().downcast_ref::<TimestampMillisecondArray>() {
+                let timestamp_ms = ts_array.value(0);
+                println!("Timestamp (milliseconds): {}", timestamp_ms);
+                println!("Timestamp digits: {}", timestamp_ms.to_string().len());
 
-                    println!("Raw OTLP time_unix_nano: {}", time_unix_nano);
-                    println!("Timestamp digits: {}", time_unix_nano.to_string().len());
-
-                    // Test all three conversion scenarios
-                    println!("\n--- Conversion Analysis ---");
-
-                    // Scenario 1: If this is nanoseconds (expected)
-                    let ms_from_nano = time_unix_nano / 1_000_000;
-                    println!(
-                        "If nanoseconds -> milliseconds (/ 1_000_000): {} ({} digits)",
-                        ms_from_nano,
-                        ms_from_nano.to_string().len()
-                    );
-
-                    // Scenario 2: If this is microseconds (hypothesis)
-                    let ms_from_micro = time_unix_nano / 1_000;
-                    println!(
-                        "If microseconds -> milliseconds (/ 1_000): {} ({} digits)",
-                        ms_from_micro,
-                        ms_from_micro.to_string().len()
-                    );
-
-                    // Scenario 3: If this is already milliseconds
-                    println!(
-                        "If already milliseconds (/ 1): {} ({} digits)",
-                        time_unix_nano,
-                        time_unix_nano.to_string().len()
-                    );
-
-                    // Check if this matches the error pattern
-                    if ms_from_nano.to_string().len() == 10 {
-                        println!("\n⚠️  FOUND THE BUG!");
-                        println!(
-                            "   Current conversion (nanos / 1_000_000) produces 10 digits: {}",
-                            ms_from_nano
-                        );
-                        println!(
-                            "   This suggests the input '{}' is in MICROSECONDS, not nanoseconds",
-                            time_unix_nano
-                        );
-                        println!(
-                            "   Correct conversion should be: {} / 1_000 = {} (13 digits)",
-                            time_unix_nano, ms_from_micro
-                        );
-                    } else if ms_from_nano.to_string().len() == 13 {
-                        println!("\n✓ Conversion is correct");
-                        println!("   Input '{}' is in nanoseconds", time_unix_nano);
-                        println!(
-                            "   Output '{}' is in milliseconds (13 digits)",
-                            ms_from_nano
-                        );
-                    }
-                }
+                assert_eq!(
+                    timestamp_ms.to_string().len(),
+                    13,
+                    "Timestamp should be 13 digits (milliseconds since epoch)"
+                );
+            } else {
+                panic!("timestamp column is not TimestampMillisecondArray");
             }
+        } else {
+            panic!("No timestamp column found");
         }
     }
 

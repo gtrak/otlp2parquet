@@ -1,22 +1,20 @@
-// otlp2parquet-batch - Optimization layer for batching
-//
-// Accumulates OTLP requests in memory and merges them into larger Arrow batches.
-// This reduces the number of storage writes and improves compression efficiency.
-//
-
-pub mod ipc;
+//! In-memory batch accumulation for server mode.
+//!
+//! Accumulates Arrow batches in memory and merges them into larger Arrow batches.
+//! This reduces the number of storage writes and improves compression efficiency.
+//!
+//! Note: This module provides the batching infrastructure for when `batch.enabled=true`
+//! in the server config. Currently the handlers write directly per-request, but this
+//! infrastructure is available for future use.
 
 use std::collections::HashMap;
 use std::marker::PhantomData;
 use std::sync::Arc;
 use std::time::Duration;
 
-use crate::otlp::traces::{TraceArrowConverter, TraceMetadata, TraceRequest};
-use crate::otlp::LogMetadata;
-use crate::{convert_request_to_arrow_with_capacity, estimate_request_row_count};
-use anyhow::{anyhow, Context, Result};
+use anyhow::{anyhow, Result};
 use arrow::array::RecordBatch;
-use otlp2parquet_proto::opentelemetry::proto::collector::logs::v1::ExportLogsServiceRequest;
+use otlp2records::PartitionedBatch;
 use parking_lot::Mutex;
 
 mod buffered_batch;
@@ -52,6 +50,15 @@ pub struct BatchConfig {
     pub max_age: Duration,
 }
 
+/// Metadata extracted during OTLP parsing for log batches.
+#[derive(Debug, Clone)]
+pub struct LogMetadata {
+    pub service_name: Arc<str>,
+    // Stored in microseconds to align with Parquet expectations.
+    pub first_timestamp_micros: i64,
+    pub record_count: usize,
+}
+
 /// Metadata required by the batching layer.
 pub trait BatchMetadata: Clone {
     fn service_name(&self) -> &Arc<str>;
@@ -83,28 +90,6 @@ impl BatchMetadata for LogMetadata {
     }
 }
 
-impl BatchMetadata for TraceMetadata {
-    fn service_name(&self) -> &Arc<str> {
-        &self.service_name
-    }
-
-    fn first_timestamp_micros(&self) -> i64 {
-        self.first_timestamp_micros
-    }
-
-    fn record_count(&self) -> usize {
-        self.span_count
-    }
-
-    fn aggregate(service_name: Arc<str>, first_timestamp_micros: i64, record_count: usize) -> Self {
-        Self {
-            service_name,
-            first_timestamp_micros,
-            span_count: record_count,
-        }
-    }
-}
-
 /// Signal-specific logic used by the batching layer.
 pub trait SignalProcessor {
     type Request;
@@ -119,56 +104,28 @@ pub trait SignalProcessor {
 
 type BatchIngestResult<M> = Result<(Vec<CompletedBatch<M>>, M)>;
 
-/// Log-specific signal processor.
+/// Log-specific signal processor using Arrow-native PartitionedBatch.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct LogSignalProcessor;
 
 impl SignalProcessor for LogSignalProcessor {
-    type Request = ExportLogsServiceRequest;
+    type Request = PartitionedBatch;
     type Metadata = LogMetadata;
 
     fn estimate_row_count(request: &Self::Request) -> usize {
-        estimate_request_row_count(request)
-    }
-
-    fn convert_request(
-        request: &Self::Request,
-        capacity_hint: usize,
-    ) -> Result<(Vec<RecordBatch>, Self::Metadata)> {
-        let (batch, metadata) = convert_request_to_arrow_with_capacity(request, capacity_hint)
-            .context("Failed to convert OTLP request to Arrow")?;
-        Ok((vec![batch], metadata))
-    }
-}
-
-/// Trace-specific signal processor placeholder.
-#[derive(Debug, Clone, Copy, Default)]
-pub struct TraceSignalProcessor;
-
-impl SignalProcessor for TraceSignalProcessor {
-    type Request = TraceRequest;
-    type Metadata = TraceMetadata;
-
-    fn estimate_row_count(request: &Self::Request) -> usize {
-        request
-            .resource_spans
-            .iter()
-            .map(|resource_spans| {
-                resource_spans
-                    .scope_spans
-                    .iter()
-                    .map(|scope_spans| scope_spans.spans.len())
-                    .sum::<usize>()
-            })
-            .sum()
+        request.record_count
     }
 
     fn convert_request(
         request: &Self::Request,
         _capacity_hint: usize,
     ) -> Result<(Vec<RecordBatch>, Self::Metadata)> {
-        let (batches, metadata) = TraceArrowConverter::convert(request)?;
-        Ok((batches, metadata))
+        let metadata = LogMetadata {
+            service_name: Arc::clone(&request.service_name),
+            first_timestamp_micros: request.min_timestamp_micros,
+            record_count: request.record_count,
+        };
+        Ok((vec![request.batch.clone()], metadata))
     }
 }
 
@@ -296,79 +253,46 @@ impl<P: SignalProcessor> BatchManager<P> {
     }
 }
 
-/// Lightweight helper when batching is disabled entirely.
-///
-/// Converts each OTLP request directly to an Arrow batch without accumulation.
-#[derive(Debug, Clone)]
-pub struct PassthroughBatcher<P: SignalProcessor = LogSignalProcessor>(PhantomData<P>);
-
-impl<P: SignalProcessor> Default for PassthroughBatcher<P> {
-    fn default() -> Self {
-        Self(PhantomData)
-    }
-}
-
-impl<P: SignalProcessor> PassthroughBatcher<P> {
-    pub fn ingest(&self, request: &P::Request) -> Result<CompletedBatch<P::Metadata>> {
-        let capacity_hint = P::estimate_row_count(request);
-        let (batches, metadata) = P::convert_request(request, capacity_hint)?;
-
-        Ok(CompletedBatch { batches, metadata })
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use otlp2parquet_proto::opentelemetry::proto::common::v1::{any_value, AnyValue, KeyValue};
-    use otlp2parquet_proto::opentelemetry::proto::logs::v1::{LogRecord, ResourceLogs, ScopeLogs};
-    use otlp2parquet_proto::opentelemetry::proto::resource::v1::Resource;
-    use prost::Message;
+    use arrow::array::{Int64Array, StringArray, TimestampMillisecondArray};
+    use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
+    use std::sync::Arc as StdArc;
 
-    fn create_test_request(service_name: &str, record_count: usize) -> ExportLogsServiceRequest {
-        let mut records = Vec::new();
-        for i in 0..record_count {
-            records.push(LogRecord {
-                time_unix_nano: 1_000_000_000 + i as u64,
-                body: Some(AnyValue {
-                    value: Some(any_value::Value::StringValue(format!("log {}", i))),
-                }),
-                ..Default::default()
-            });
+    fn create_test_batch(service_name: &str, record_count: usize) -> PartitionedBatch {
+        let schema = StdArc::new(Schema::new(vec![
+            Field::new(
+                "timestamp",
+                DataType::Timestamp(TimeUnit::Millisecond, None),
+                false,
+            ),
+            Field::new("service_name", DataType::Utf8, true),
+            Field::new("severity_number", DataType::Int64, true),
+        ]));
+
+        let timestamps: Vec<i64> = (0..record_count)
+            .map(|i| 1_700_000_000_000 + i as i64)
+            .collect();
+        let services: Vec<&str> = vec![service_name; record_count];
+        let severities: Vec<i64> = vec![9; record_count];
+
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                StdArc::new(TimestampMillisecondArray::from(timestamps.clone())),
+                StdArc::new(StringArray::from(services)),
+                StdArc::new(Int64Array::from(severities)),
+            ],
+        )
+        .unwrap();
+
+        PartitionedBatch {
+            batch,
+            service_name: Arc::from(service_name),
+            min_timestamp_micros: timestamps[0] * 1000, // Convert ms to us
+            record_count,
         }
-
-        ExportLogsServiceRequest {
-            resource_logs: vec![ResourceLogs {
-                resource: Some(Resource {
-                    attributes: vec![KeyValue {
-                        key: "service.name".to_string(),
-                        value: Some(AnyValue {
-                            value: Some(any_value::Value::StringValue(service_name.to_string())),
-                        }),
-                    }],
-                    ..Default::default()
-                }),
-                scope_logs: vec![ScopeLogs {
-                    log_records: records,
-                    ..Default::default()
-                }],
-                ..Default::default()
-            }],
-        }
-    }
-
-    #[test]
-    fn test_passthrough_batcher() {
-        let batcher = PassthroughBatcher::<LogSignalProcessor>::default();
-        let request = create_test_request("test-service", 10);
-
-        let result = batcher.ingest(&request);
-        assert!(result.is_ok());
-
-        let completed = result.unwrap();
-        assert_eq!(completed.batches[0].num_rows(), 10);
-        assert_eq!(completed.metadata.service_name.as_ref(), "test-service");
-        assert_eq!(completed.metadata.record_count, 10);
     }
 
     #[test]
@@ -381,14 +305,14 @@ mod tests {
         let manager = BatchManager::<LogSignalProcessor>::new(config);
 
         // First request - should not flush
-        let request1 = create_test_request("test-service", 10);
-        let approx1 = request1.encoded_len();
+        let request1 = create_test_batch("test-service", 10);
+        let approx1 = 320; // Approximate bytes
         let (completed1, _meta1) = manager.ingest(&request1, approx1).unwrap();
         assert_eq!(completed1.len(), 0); // Not flushed yet
 
         // Second request - should not flush (total 20 rows)
-        let request2 = create_test_request("test-service", 10);
-        let approx2 = request2.encoded_len();
+        let request2 = create_test_batch("test-service", 10);
+        let approx2 = 320;
         let (completed2, _meta2) = manager.ingest(&request2, approx2).unwrap();
         assert_eq!(completed2.len(), 0); // Still not flushed
 
@@ -400,13 +324,13 @@ mod tests {
         };
         let manager_small = BatchManager::<LogSignalProcessor>::new(config_small);
 
-        let req1 = create_test_request("test-service", 10);
-        let approx_small_1 = req1.encoded_len();
+        let req1 = create_test_batch("test-service", 10);
+        let approx_small_1 = 320;
         let (c1, _) = manager_small.ingest(&req1, approx_small_1).unwrap();
         assert_eq!(c1.len(), 0); // 10 rows < 20, no flush
 
-        let req2 = create_test_request("test-service", 10);
-        let approx_small_2 = req2.encoded_len();
+        let req2 = create_test_batch("test-service", 10);
+        let approx_small_2 = 320;
         let (c2, _) = manager_small.ingest(&req2, approx_small_2).unwrap();
         assert_eq!(c2.len(), 1); // 10 + 10 = 20 rows, should flush!
         assert_eq!(
