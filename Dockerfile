@@ -17,10 +17,10 @@ WORKDIR /build
 
 # Copy manifests and source
 COPY Cargo.toml Cargo.lock ./
-COPY crates ./crates
+COPY src ./src
 
 # Build the binary
-RUN cargo build --release -p otlp2parquet --bin otlp2parquet
+RUN cargo build --release --bin otlp2parquet
 
 # Strip binary for smaller size
 RUN strip target/release/otlp2parquet
