@@ -3,6 +3,7 @@ name: CI
 # Validates the server target (default mode - native binary with OpenDAL multi-backend)
 
 on:
+  workflow_call:
   push:
     branches: ["main"]
   pull_request:
