@@ -149,16 +149,3 @@ jobs:
         if: failure()
         run: docker compose logs
 
-  build-artifacts:
-    name: Package Release Artifacts
-    needs:
-      - fmt
-      - clippy
-      - test
-      - build
-      - audit
-      - docs
-      - smoke-server
-    if: startsWith(github.ref, 'refs/tags/v')
-    uses: ./.github/workflows/build-artifacts.yml
-    secrets: inherit
