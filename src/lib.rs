@@ -40,6 +40,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::signal;
+use axum::extract::DefaultBodyLimit;
 use tower_http::decompression::RequestDecompressionLayer;
 use tracing::{debug, error, info, warn};
 
@@ -203,6 +204,7 @@ pub async fn run_with_config(config: RuntimeConfig) -> Result<()> {
         .route("/v1/metrics", post(handle_metrics))
         .route("/health", get(health_check))
         .route("/ready", get(ready_check))
+        .layer(DefaultBodyLimit::max(max_payload_bytes))
         .layer(RequestDecompressionLayer::new().gzip(true))
         .with_state(router_state);
 
