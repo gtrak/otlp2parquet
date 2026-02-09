@@ -15,7 +15,7 @@ name = "otlp2parquet"
 path = "src/main.rs"
 
 [dependencies]
-otlp2records = { git = "https://github.com/gtrak/otlp2records.git", branch = "main", default-features = false, features = ["parquet"] }
+otlp2records = { git = "https://github.com/gtrak/otlp2records.git", rev = "9d6fa9e327bab357e6d408cd8d5d99a65dabce34", default-features = false, features = ["parquet"] }
 
 arrow = { version = "57.2", default-features = false, features = ["ipc"] }
 
